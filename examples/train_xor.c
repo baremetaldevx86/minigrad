@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "engine.h"
 #include "nn.h"
 #include "mlp.h"
@@ -86,9 +87,9 @@ int main() {
     tensor_release(final_pred);
     tensor_release(X);
     tensor_release(Y);
-    mlp_free(model);
     sgd_free(opt);
-    // free(params); // Double free! sgd_free already frees this.
-    
+    free(params);
+    mlp_free(model);
+
     return 0;
 }

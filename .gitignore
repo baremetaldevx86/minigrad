@@ -1,5 +1,6 @@
 *.o
 train
+test
 test_engine
 .DS_Store
 

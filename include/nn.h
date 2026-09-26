@@ -16,7 +16,8 @@ Linearlayer* linear_create(int in_features, int out_features);
 // Forward Pass
 Tensor* linear_forward(Linearlayer* layer, Tensor* x);
 
-// Access parameters (for optimizer)
+// Access parameters (for optimizer). The returned array is caller-owned;
+// the tensors remain owned by the layer.
 Tensor** linear_params(Linearlayer* layer, int* n_params);
 void linear_free(Linearlayer* layer);
 

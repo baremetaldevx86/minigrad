@@ -4,7 +4,7 @@
 #include "engine.h"
 
 typedef struct {
-    Tensor** params; // borrowed, NOT owned
+    Tensor** params; // borrowed, NOT owned; caller must free the array
     int n_params;
     float lr;
 } SGD;

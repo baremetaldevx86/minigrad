@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "engine.h"
 #include "nn.h"
 #include "loss.h"
@@ -81,8 +82,9 @@ int main() {
     tensor_release(pred);
     tensor_release(X);
     tensor_release(Y);
-    linear_free(model);
     sgd_free(opt);
+    free(params);
+    linear_free(model);
 
     return 0;
 }

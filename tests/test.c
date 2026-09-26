@@ -9,4 +9,7 @@ int main(){
 
     printf("value = %f\n", *b->data); // 2.0
     printf("grad  = %f\n", *a->grad); // 0.25
+
+    tensor_release(b);
+    tensor_release(a);
 }
