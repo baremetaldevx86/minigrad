@@ -37,19 +37,24 @@ static float compute_accuracy(MLP* model, MNISTData* data) {
 
     Tensor* X = tensor_create_matrix(EVAL_BATCH, 784);
 
-    for (int i = 0; i < n; i += EVAL_BATCH) {
-        int bs = (i + EVAL_BATCH > n) ? (n - i) : EVAL_BATCH;
+    if (!X) return NAN;
+    for (int i = 0; i < n; ) {
+        int bs = (n - i < EVAL_BATCH) ? (n - i) : EVAL_BATCH;
 
         /* Fill batch */
         for (int b = 0; b < bs; b++) {
             for (int k = 0; k < 784; k++) {
                 X->data[b * 784 + k] =
-                    data->images[(i + b) * 784 + k];
+                    data->images[(size_t)(i + b) * 784 + (size_t)k];
             }
         }
 
         /* Forward (no backward called → safe) */
         Tensor* logits = mlp_forward(model, X, 1);
+        if (!logits) {
+            tensor_release(X);
+            return NAN;
+        }
 
         for (int b = 0; b < bs; b++) {
             int pred = 0;
@@ -68,6 +73,7 @@ static float compute_accuracy(MLP* model, MNISTData* data) {
         }
 
         tensor_release(logits);
+        i += bs;
     }
 
     tensor_release(X);
@@ -77,6 +83,13 @@ static float compute_accuracy(MLP* model, MNISTData* data) {
 /* =================== MAIN =================== */
 
 int main(void) {
+    int status = EXIT_FAILURE;
+    MLP* model = NULL;
+    Tensor** params = NULL;
+    SGD* opt = NULL;
+    Tensor* X = NULL;
+    Tensor* Y = NULL;
+    int* indices = NULL;
     srand(SEED);
 
     printf("Loading MNIST data...\n");
@@ -91,7 +104,13 @@ int main(void) {
 
     if (!train || !test) {
         fprintf(stderr, "Failed to load MNIST data\n");
-        return 1;
+        goto cleanup;
+    }
+    // The loader supports arbitrary IDX dimensions; this model requires 784.
+    if (train->input_dim != 784 || test->input_dim != 784 ||
+        train->n_samples < BATCH_SIZE || test->n_samples <= 0) {
+        fprintf(stderr, "Expected 28x28 data and at least one full training batch\n");
+        goto cleanup;
     }
 
     printf("Loaded MNIST data: %d train, %d test\n",
@@ -99,23 +118,31 @@ int main(void) {
 
     /* Model: 784 → 256 → 128 → 10 */
     int layers[] = {784, 256, 128, 10};
-    MLP* model = mlp_create(layers, 3);
+    model = mlp_create(layers, 3);
+    if (!model) goto cleanup;
 
     int n_params = 0;
-    Tensor** params = mlp_params(model, &n_params);
+    params = mlp_params(model, &n_params);
+    if (!params) goto cleanup;
 
-    SGD* opt = sgd_create(params, n_params, BASE_LR);
+    opt = sgd_create(params, n_params, BASE_LR);
+    if (!opt) goto cleanup;
 
     printf("Model created. Parameters: %d\n", mlp_count_scalar_params(model));
     printf("Training for %d epochs | batch=%d | lr=%.4f\n",
            EPOCHS, BATCH_SIZE, BASE_LR);
 
     /* Training buffers */
-    Tensor* X = tensor_create_matrix(BATCH_SIZE, 784);
-    Tensor* Y = tensor_create_matrix(BATCH_SIZE, 10);
+    X = tensor_create_matrix(BATCH_SIZE, 784);
+    Y = tensor_create_matrix(BATCH_SIZE, 10);
+    if (!X || !Y) goto cleanup;
 
-    /* Shuffle indices */
-    int* indices = malloc(train->n_samples * sizeof(int));
+    /* Loader already verified n_samples * sizeof(int) fits size_t. */
+    indices = malloc((size_t)train->n_samples * sizeof(*indices));
+    if (!indices) {
+        fprintf(stderr, "Failed to allocate shuffle indices\n");
+        goto cleanup;
+    }
     for (int i = 0; i < train->n_samples; i++)
         indices[i] = i;
 
@@ -144,7 +171,7 @@ int main(void) {
                 int idx = indices[base + i];
                 for (int k = 0; k < 784; k++) {
                     X->data[i * 784 + k] =
-                        train->images[idx * 784 + k];
+                        train->images[(size_t)idx * 784 + (size_t)k];
                 }
             }
 
@@ -158,7 +185,12 @@ int main(void) {
             }
 
             Tensor* logits = mlp_forward(model, X, 1);
+            if (!logits) goto cleanup;
             Tensor* loss = cross_entropy_loss(logits, Y);
+            if (!loss) {
+                tensor_release(logits);
+                goto cleanup;
+            }
 
             epoch_loss += loss->data[0] * BATCH_SIZE;
 
@@ -187,10 +219,12 @@ int main(void) {
 
     printf("Computing final accuracy...\n");
     float acc = compute_accuracy(model, test);
+    if (!isfinite(acc)) goto cleanup;
     printf("Final Test Accuracy: %.2f%%\n", acc * 100.0f);
+    status = EXIT_SUCCESS;
 
     /* ================= CLEANUP ================= */
-
+cleanup:
     free(indices);
     tensor_release(X);
     tensor_release(Y);
@@ -200,5 +234,5 @@ int main(void) {
     mnist_free(train);
     mnist_free(test);
 
-    return 0;
+    return status;
 }

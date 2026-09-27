@@ -13,10 +13,16 @@
 // 1 0 -> 1
 // 1 1 -> 0
 
-int main() {
+int main(void) {
+    int status = EXIT_FAILURE;
+    MLP* model = NULL;
+    Tensor** params = NULL;
+    SGD* opt = NULL;
+    Tensor* final_pred = NULL;
     // 1. Prepare Data
     Tensor* X = tensor_create_matrix(4, 2);
     Tensor* Y = tensor_create_matrix(4, 1);
+    if (!X || !Y) goto cleanup;
     
     // Inputs
     X->data[0] = 0.0f; X->data[1] = 0.0f;
@@ -34,12 +40,15 @@ int main() {
     // 2 inputs -> 4 hidden (Relu) -> 1 output (Linear/Sigmoid)
     // Note: We use raw linear output with MSE. A 4-neuron hidden layer is enough for XOR.
     int layer_sizes[] = {2, 4, 1};
-    MLP* model = mlp_create(layer_sizes, 2); // 2 layers: {2->4, 4->1}
+    model = mlp_create(layer_sizes, 2); // 2 layers: {2->4, 4->1}
+    if (!model) goto cleanup;
     
     // 3. Optimizer
     int n_params;
-    Tensor** params = mlp_params(model, &n_params);
-    SGD* opt = sgd_create(params, n_params, 0.1f); // Learning rate 0.1
+    params = mlp_params(model, &n_params);
+    if (!params) goto cleanup;
+    opt = sgd_create(params, n_params, 0.1f); // Learning rate 0.1
+    if (!opt) goto cleanup;
     
     printf("Training XOR with MLP (2->4->1)...\n");
     
@@ -49,9 +58,14 @@ int main() {
         // Forward
         // Use Tanh (0) for hidden layers (better convergence for small XOR net)
         Tensor* y_pred = mlp_forward(model, X, 0);
-        
+        if (!y_pred) goto cleanup;
+
         // Loss (MSE for regression-style training on 0/1)
         Tensor* loss = mse_loss(y_pred, Y);
+        if (!loss) {
+            tensor_release(y_pred);
+            goto cleanup;
+        }
         
         // Zero Grad
         sgd_zero_grad(opt);
@@ -74,7 +88,8 @@ int main() {
     // 5. Validation
     printf("\nOptimization Finished!\n");
     printf("Predictions:\n");
-    Tensor* final_pred = mlp_forward(model, X, 0);
+    final_pred = mlp_forward(model, X, 0);
+    if (!final_pred) goto cleanup;
     for (int i = 0; i < 4; i++) {
         float input1 = X->data[i*2];
         float input2 = X->data[i*2+1];
@@ -83,7 +98,9 @@ int main() {
         printf("In: [%.0f, %.0f] Target: %.0f Pred: %.4f\n", input1, input2, target, pred);
     }
     
-    // Cleanup
+    status = EXIT_SUCCESS;
+
+cleanup:
     tensor_release(final_pred);
     tensor_release(X);
     tensor_release(Y);
@@ -91,5 +108,5 @@ int main() {
     free(params);
     mlp_free(model);
 
-    return 0;
+    return status;
 }

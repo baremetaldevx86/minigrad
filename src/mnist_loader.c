@@ -1,84 +1,113 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
 #include "mnist_loader.h"
 
-// Helper: Read 32-bit integer (Big Endian -> Host Endian)
-static uint32_t read_uint32(FILE* f) {
-    uint32_t v;
-    if (fread(&v, sizeof(v), 1, f) != 1) return 0;
-    // Swap bytes: data is Big Endian, x86 is Little Endian
-    return ((v << 24) & 0xFF000000) |
-           ((v << 8)  & 0x00FF0000) |
-           ((v >> 8)  & 0x0000FF00) |
-           ((v >> 24) & 0x000000FF);
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* IDX stores header integers in network (big-endian) byte order. */
+static int read_uint32(FILE *file, uint32_t *value) {
+    unsigned char bytes[4];
+    if (fread(bytes, 1, sizeof(bytes), file) != sizeof(bytes)) return 0;
+    *value = ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
+             ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3];
+    return 1;
 }
 
-MNISTData* load_mnist(const char* images_path, const char* labels_path) {
-    FILE* f_img = fopen(images_path, "rb");
-    FILE* f_lbl = fopen(labels_path, "rb");
-
-    if (!f_img || !f_lbl) {
-        printf("Error: Could not open MNIST files: %s, %s\n", images_path, labels_path);
-        if (f_img) fclose(f_img);
-        if (f_lbl) fclose(f_lbl);
+MNISTData *load_mnist(const char *images_path, const char *labels_path) {
+    if (!images_path || !labels_path) {
+        fprintf(stderr, "minigrad: load_mnist: paths must not be NULL\n");
         return NULL;
     }
 
-    // Read headers
-    uint32_t magic_img = read_uint32(f_img);
-    uint32_t n_img = read_uint32(f_img);
-    uint32_t rows = read_uint32(f_img);
-    uint32_t cols = read_uint32(f_img);
-
-    uint32_t magic_lbl = read_uint32(f_lbl);
-    uint32_t n_lbl = read_uint32(f_lbl);
-
-    if (magic_img != 2051 || magic_lbl != 2049 || n_img != n_lbl) {
-        printf("Error: Invalid MNIST file format or count mismatch\n");
-        printf("Magic: %d / %d, Count: %d / %d\n", magic_img, magic_lbl, n_img, n_lbl);
-        fclose(f_img);
-        fclose(f_lbl);
+    FILE *images = fopen(images_path, "rb");
+    if (!images) {
+        perror(images_path);
+        return NULL;
+    }
+    FILE *labels = fopen(labels_path, "rb");
+    if (!labels) {
+        perror(labels_path);
+        fclose(images);
         return NULL;
     }
 
-    MNISTData* data = (MNISTData*)malloc(sizeof(MNISTData));
-    data->n_samples = n_img;
-    data->input_dim = rows * cols; // 28 * 28 = 784
+    MNISTData *data = NULL;
+    unsigned char *row_buffer = NULL;
+    uint32_t magic_img, n_img, rows, cols, magic_lbl, n_lbl;
+    if (!read_uint32(images, &magic_img) || !read_uint32(images, &n_img) ||
+        !read_uint32(images, &rows) || !read_uint32(images, &cols) ||
+        !read_uint32(labels, &magic_lbl) || !read_uint32(labels, &n_lbl)) {
+        fprintf(stderr, "minigrad: load_mnist: truncated IDX header\n");
+        goto fail;
+    }
 
-    // Allocate memory
-    data->images = (float*)malloc(sizeof(float) * data->n_samples * data->input_dim);
-    data->labels = (int*)malloc(sizeof(int) * data->n_samples);
+    if (magic_img != 2051 || magic_lbl != 2049 || !n_img || n_img != n_lbl ||
+        n_img > INT_MAX || !rows || !cols ||
+        (size_t)rows > (size_t)INT_MAX / (size_t)cols) {
+        fprintf(stderr, "minigrad: load_mnist: invalid IDX header\n");
+        goto fail;
+    }
+    size_t count = (size_t)n_img;
+    size_t dimension = (size_t)rows * (size_t)cols;
+    if (dimension > SIZE_MAX / count ||
+        count * dimension > SIZE_MAX / sizeof(float) ||
+        count > SIZE_MAX / sizeof(int)) {
+        fprintf(stderr, "minigrad: load_mnist: allocation size overflow\n");
+        goto fail;
+    }
 
-    // Read Data
-    // Images: Read byte by byte and normalize to [0, 1]
-    unsigned char* img_buf = (unsigned char*)malloc(data->input_dim);
-    for (int i = 0; i < data->n_samples; i++) {
-        fread(img_buf, 1, data->input_dim, f_img);
-        for (int j = 0; j < data->input_dim; j++) {
-            data->images[i * data->input_dim + j] = (float)img_buf[j] / 255.0f;
+    data = (MNISTData *)calloc(1, sizeof(*data));
+    if (!data) goto out_of_memory;
+    data->n_samples = (int)count;
+    data->input_dim = (int)dimension;
+    data->images = (float *)malloc(count * dimension * sizeof(float));
+    data->labels = (int *)malloc(count * sizeof(int));
+    row_buffer = (unsigned char *)malloc(dimension);
+    if (!data->images || !data->labels || !row_buffer) goto out_of_memory;
+
+    for (size_t i = 0; i < count; i++) {
+        if (fread(row_buffer, 1, dimension, images) != dimension) {
+            fprintf(stderr, "minigrad: load_mnist: truncated image data\n");
+            goto fail;
+        }
+        for (size_t j = 0; j < dimension; j++) {
+            data->images[i * dimension + j] = (float)row_buffer[j] / 255.0f;
         }
     }
-    free(img_buf);
-
-    // Labels: Read byte by byte
-    unsigned char lbl_buf;
-    for (int i = 0; i < data->n_samples; i++) {
-        fread(&lbl_buf, 1, 1, f_lbl);
-        data->labels[i] = (int)lbl_buf;
+    for (size_t i = 0; i < count; i++) {
+        unsigned char label;
+        if (fread(&label, 1, 1, labels) != 1) {
+            fprintf(stderr, "minigrad: load_mnist: truncated label data\n");
+            goto fail;
+        }
+        if (label > 9) {
+            fprintf(stderr, "minigrad: load_mnist: invalid digit label\n");
+            goto fail;
+        }
+        data->labels[i] = (int)label;
     }
 
-    fclose(f_img);
-    fclose(f_lbl);
-
-    printf("Loaded MNIST data: %d samples, %d features\n", data->n_samples, data->input_dim);
+    free(row_buffer);
+    fclose(images);
+    fclose(labels);
+    printf("Loaded MNIST data: %d samples, %d features\n",
+           data->n_samples, data->input_dim);
     return data;
+
+out_of_memory:
+    fprintf(stderr, "minigrad: load_mnist: out of memory\n");
+fail:
+    free(row_buffer);
+    mnist_free(data);
+    fclose(images);
+    fclose(labels);
+    return NULL;
 }
 
-void mnist_free(MNISTData* data) {
-    if (data) {
-        free(data->images);
-        free(data->labels);
-        free(data);
-    }
+void mnist_free(MNISTData *data) {
+    if (!data) return;
+    free(data->images);
+    free(data->labels);
+    free(data);
 }

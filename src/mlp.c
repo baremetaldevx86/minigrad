@@ -1,99 +1,116 @@
-#include <stdlib.h>
-#include <stdio.h>
 #include "mlp.h"
 
-MLP* mlp_create(int* layer_sizes, int n_layers) {
-    MLP* mlp = (MLP*)malloc(sizeof(MLP));
-    mlp->n_layers = n_layers;
-    mlp->layers = (Linearlayer**)malloc(sizeof(Linearlayer*) * n_layers);
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-    for (int i = 0; i < n_layers; i++) {
-        // layer_sizes[i] is input size, layer_sizes[i+1] is output size
-        mlp->layers[i] = linear_create(layer_sizes[i], layer_sizes[i+1]);
+MLP *mlp_create(int *layer_sizes, int n_layers) {
+    if (!layer_sizes || n_layers <= 0 ||
+        (size_t)n_layers > SIZE_MAX / sizeof(Linearlayer *)) {
+        fprintf(stderr, "minigrad: mlp_create: invalid layer configuration\n");
+        return NULL;
     }
 
+    MLP *mlp = (MLP *)calloc(1, sizeof(*mlp));
+    if (!mlp) {
+        fprintf(stderr, "minigrad: mlp_create: out of memory\n");
+        return NULL;
+    }
+    mlp->n_layers = n_layers;
+    mlp->layers = (Linearlayer **)calloc((size_t)n_layers, sizeof(*mlp->layers));
+    if (!mlp->layers) {
+        fprintf(stderr, "minigrad: mlp_create: out of memory\n");
+        mlp_free(mlp);
+        return NULL;
+    }
+
+    for (int i = 0; i < n_layers; i++) {
+        if (layer_sizes[i] <= 0 || layer_sizes[i + 1] <= 0) {
+            fprintf(stderr, "minigrad: mlp_create: layer sizes must be positive\n");
+            mlp_free(mlp);
+            return NULL;
+        }
+        mlp->layers[i] = linear_create(layer_sizes[i], layer_sizes[i + 1]);
+        if (!mlp->layers[i]) {
+            mlp_free(mlp);
+            return NULL;
+        }
+    }
     return mlp;
 }
 
-Tensor* mlp_forward(MLP* mlp, Tensor* x, int use_relu) {
-    Tensor* current_input = x;
-    tensor_retain(current_input); // Retain initial input since we release inside loop
-
-    for (int i = 0; i < mlp->n_layers; i++) {
-        // Linear transformation
-        Tensor* z = linear_forward(mlp->layers[i], current_input);
-        
-        // Release previous input (we are done with it for valid graph construction handling)
-        // Note: linear_forward retains ‘current_input’ as a parent of ‘z’, 
-        // so we can release our local holding reference.
-        tensor_release(current_input);
-        
-        // Apply activation if not the last layer
-        // (Last layer usually feeds into loss directly, e.g. MSE or CrossEntropyLogits)
-        if (i < mlp->n_layers - 1) {
-            Tensor* a;
-            if (use_relu) {
-                a = tensor_relu(z);
-            } else {
-                a = tensor_Tanh(z);
-            }
-            tensor_release(z); // z is now parent of a
-            current_input = a;
-        } else {
-            // Last layer: linear output (logits)
-            current_input = z;
-        }
+Tensor *mlp_forward(MLP *mlp, Tensor *x, int use_relu) {
+    if (!mlp || !mlp->layers || mlp->n_layers <= 0 || !x) {
+        fprintf(stderr, "minigrad: mlp_forward: invalid model or input\n");
+        return NULL;
     }
 
-    return current_input;
+    Tensor *current = x;
+    tensor_retain(current);
+    for (int i = 0; i < mlp->n_layers; i++) {
+        Tensor *z = linear_forward(mlp->layers[i], current);
+        tensor_release(current);
+        if (!z) return NULL;
+
+        if (i == mlp->n_layers - 1) return z;
+
+        current = use_relu ? tensor_relu(z) : tensor_Tanh(z);
+        tensor_release(z);
+        if (!current) return NULL;
+    }
+    return NULL;
 }
 
-Tensor** mlp_params(MLP* mlp, int* n_params) {
-    // First pass: count total parameters
-    int total_params = 0;
-    for (int i = 0; i < mlp->n_layers; i++) {
-        int layer_n_params;
-        Tensor** layer_params = linear_params(mlp->layers[i], &layer_n_params);
-        total_params += layer_n_params;
-        free(layer_params); // free the temporary array, not the tensors
+Tensor **mlp_params(MLP *mlp, int *n_params) {
+    if (n_params) *n_params = 0;
+    if (!n_params || !mlp || !mlp->layers || mlp->n_layers <= 0 ||
+        mlp->n_layers > INT_MAX / 2 ||
+        (size_t)mlp->n_layers > SIZE_MAX / (2 * sizeof(Tensor *))) {
+        return NULL;
     }
 
-    // Allocate array
-    Tensor** params = (Tensor**)malloc(sizeof(Tensor*) * total_params);
-    
-    // Second pass: collect parameters
-    int offset = 0;
+    int count = mlp->n_layers * 2;
+    Tensor **params = (Tensor **)malloc((size_t)count * sizeof(*params));
+    if (!params) {
+        fprintf(stderr, "minigrad: mlp_params: out of memory\n");
+        return NULL;
+    }
     for (int i = 0; i < mlp->n_layers; i++) {
-        int layer_n_params;
-        Tensor** layer_params = linear_params(mlp->layers[i], &layer_n_params);
-        
-        for (int j = 0; j < layer_n_params; j++) {
-            params[offset + j] = layer_params[j];
+        if (!mlp->layers[i] || !mlp->layers[i]->W || !mlp->layers[i]->b) {
+            free(params);
+            return NULL;
         }
-        offset += layer_n_params;
-        
-        free(layer_params);
+        params[i * 2] = mlp->layers[i]->W;
+        params[i * 2 + 1] = mlp->layers[i]->b;
     }
-
-    *n_params = total_params;
+    *n_params = count;
     return params;
 }
 
-int mlp_count_scalar_params(MLP* mlp) {
+int mlp_count_scalar_params(MLP *mlp) {
+    if (!mlp || !mlp->layers || mlp->n_layers <= 0) return 0;
     int total = 0;
     for (int i = 0; i < mlp->n_layers; i++) {
-        total += mlp->layers[i]->W->size;
-        total += mlp->layers[i]->b->size;
+        Linearlayer *layer = mlp->layers[i];
+        if (!layer || !layer->W || !layer->b || layer->W->size < 0 ||
+            layer->b->size < 0 || layer->W->size > INT_MAX - total ||
+            layer->b->size > INT_MAX - total - layer->W->size) {
+            fprintf(stderr, "minigrad: mlp_count_scalar_params: count overflow or invalid model\n");
+            return -1;
+        }
+        total += layer->W->size + layer->b->size;
     }
     return total;
 }
 
-void mlp_free(MLP* mlp) {
-    if (mlp) {
+void mlp_free(MLP *mlp) {
+    if (!mlp) return;
+    if (mlp->layers) {
         for (int i = 0; i < mlp->n_layers; i++) {
             linear_free(mlp->layers[i]);
         }
-        free(mlp->layers);
-        free(mlp);
     }
+    free(mlp->layers);
+    free(mlp);
 }

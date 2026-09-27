@@ -1,4 +1,7 @@
 *.o
+*.d
+*_sanitize
+test_safety
 train
 test
 test_engine

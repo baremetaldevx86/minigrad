@@ -9,6 +9,7 @@
 void create_dataset(Tensor** X, Tensor** Y, int n) {
     *X = tensor_create_matrix(n, 1);
     *Y = tensor_create_matrix(n, 1);
+    if (!*X || !*Y) return;
 
     for (int i = 0; i < n; i++) {
         float x = (float)i;
@@ -24,26 +25,41 @@ int main() {
     int epochs = 10000;
     float lr = 0.001f;
 
-    // Create dataset
-    Tensor* X;
-    Tensor* Y;
+    int status = EXIT_FAILURE;
+    Tensor* X = NULL;
+    Tensor* Y = NULL;
+    Tensor* tx = NULL;
+    Tensor* pred = NULL;
+    Tensor** params = NULL;
+    SGD* opt = NULL;
+    Linearlayer* model = NULL;
+
     create_dataset(&X, &Y, n_samples);
+    if (!X || !Y) goto cleanup;
 
     // Create model: Linear(1 → 1)
-    Linearlayer* model = linear_create(1, 1);
+    model = linear_create(1, 1);
+    if (!model) goto cleanup;
 
     // Get parameters for optimizer
     int n_params;
-    Tensor** params = linear_params(model, &n_params);
+    params = linear_params(model, &n_params);
+    if (!params) goto cleanup;
 
     // Create optimizer
-    SGD* opt = sgd_create(params, n_params, lr);
+    opt = sgd_create(params, n_params, lr);
+    if (!opt) goto cleanup;
 
     // Training loop
     for (int epoch = 0; epoch < epochs; epoch++) {
         // Forward
         Tensor* y_pred = linear_forward(model, X);
+        if (!y_pred) goto cleanup;
         Tensor* loss = mse_loss(y_pred, Y);
+        if (!loss) {
+            tensor_release(y_pred);
+            goto cleanup;
+        }
 
         // Zero gradients
         sgd_zero_grad(opt);
@@ -71,13 +87,17 @@ int main() {
 
     // Test prediction
     float test_x = 10.0f;
-    Tensor* tx = tensor_create_matrix(1,1);
+    tx = tensor_create_matrix(1,1);
+    if (!tx) goto cleanup;
     tx->data[0] = test_x;
 
-    Tensor* pred = linear_forward(model, tx);
+    pred = linear_forward(model, tx);
+    if (!pred) goto cleanup;
     printf("\nPrediction for x=10: %f (expected ~32)\n", pred->data[0]);
 
-    // Cleanup
+    status = EXIT_SUCCESS;
+
+cleanup:
     tensor_release(tx);
     tensor_release(pred);
     tensor_release(X);
@@ -86,6 +106,6 @@ int main() {
     free(params);
     linear_free(model);
 
-    return 0;
+    return status;
 }
 

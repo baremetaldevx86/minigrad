@@ -2,7 +2,7 @@
 
 A from-scratch automatic differentiation engine written in pure C. No frameworks. No dependencies. No Python. Just raw C, manual memory management, and reverse-mode autodiff.
 
-Trains a 3-layer MLP on MNIST from raw pixels and reaches **98.01% test accuracy** -- all in ~1,150 lines of library code.
+Trains a 3-layer MLP on MNIST from raw pixels and reaches **98.01% test accuracy** -- using only the C library and `libm`.
 
 <img width="823" height="780" alt="mnist-training" src="https://github.com/user-attachments/assets/bc408345-be08-4b17-a631-2288f440e64d" />
 
@@ -12,7 +12,7 @@ Trains a 3-layer MLP on MNIST from raw pixels and reaches **98.01% test accuracy
 
 Every deep learning framework hides the autograd behind thousands of lines of abstraction. rawgrad does not.
 
-The entire differentiation engine fits in a single 715-line C file. Every tensor tracks its parents in a dynamically constructed computation graph. Calling `tensor_backward()` topologically sorts that graph and walks it in reverse, invoking each node's backward kernel. Gradients accumulate via the chain rule. That is the whole engine.
+The differentiation engine lives in a single C file. Every tensor tracks its parents in a dynamically constructed computation graph. Calling `tensor_backward()` topologically sorts that graph and walks it in reverse, invoking each node's backward kernel. Gradients accumulate via the chain rule. That is the whole engine.
 
 Everything else -- linear layers, MLP, loss functions, the optimizer -- is built directly on top of those primitives.
 
@@ -58,24 +58,25 @@ Converges to near-zero loss in 5,000 epochs, correctly classifying all four XOR 
 
 ```
 src/
-  engine.c           715 lines  -- core tensor type, forward/backward ops, autograd
-  nn.c                88 lines  -- linear layer (y = xW + b), He init
-  mlp.c               99 lines  -- multi-layer perceptron
-  loss.c              122 lines  -- MSE loss, fused softmax cross-entropy
-  optim.c              42 lines  -- SGD optimizer
-  mnist_loader.c       84 lines  -- IDX binary format parser
+  engine.c            -- core tensor type, forward/backward ops, autograd
+  nn.c                -- linear layer (y = xW + b), He init
+  mlp.c               -- multi-layer perceptron
+  loss.c              -- MSE loss, fused softmax cross-entropy
+  optim.c             -- SGD optimizer
+  mnist_loader.c      -- checked IDX binary format parser
 
 include/
   engine.h  nn.h  mlp.h  loss.h  optim.h  mnist_loader.h
 
 examples/
-  train.c             89 lines  -- minimal training demo
-  train_xor.c         94 lines  -- XOR classification
-  train_mnist.c      204 lines  -- full MNIST training loop
+  train.c             -- minimal training demo
+  train_xor.c         -- XOR classification
+  train_mnist.c       -- full MNIST training loop
 
 tests/
-  test.c              12 lines
-  test_engine.c      112 lines
+  test.c              -- sqrt smoke test
+  test_engine.c       -- operation, gradient, broadcasting and loss regressions
+  test_safety.c       -- deep graphs, ownership, invalid inputs and IDX failures
 ```
 
 ---
@@ -97,7 +98,7 @@ Every operation has both a forward kernel and a hand-written backward kernel.
 | Mean | `tensor_mean(a)` | dL/da_i += dL/dc / n |
 | ReLU | `tensor_relu(a)` | dL/da += dL/dc if a > 0, else 0 |
 | Tanh | `tensor_Tanh(a)` | dL/da += (1 - tanh^2(a)) * dL/dc |
-| Softmax | `tensor_softmax(a)` | Used inside fused cross-entropy |
+| Softmax | `tensor_softmax(a)` | Row-wise Jacobian-vector product |
 | Cross-Entropy | `cross_entropy_loss(logits, targets)` | dL/dz = (softmax(z) - y) / batch_size |
 
 ---
@@ -115,13 +116,13 @@ Every operation has both a forward kernel and a hand-written backward kernel.
    e. Gradients accumulate into parent .grad buffers via the chain rule
 ```
 
-The topological sort uses a recursive DFS with a visited set. The backward pass is a single linear sweep over the sorted list.
+The topological sort uses an iterative DFS with a dynamically sized pointer set. The backward pass is a single linear sweep over the sorted list. Each call clears gradients throughout the reachable graph; non-scalar outputs seed all elements with one, computing the gradient of their sum.
 
 ---
 
 ## Memory Model
 
-Tensors use **manual reference counting**. Every operation that creates a new tensor calls `tensor_retain()` on its parents. When you are done with a tensor, call `tensor_release()`. When the reference count hits zero, the tensor and its entire unreachable subgraph are freed recursively.
+Tensors use **manual reference counting**. Every operation that creates a new tensor calls `tensor_retain()` on its parents. When you are done with a tensor, call `tensor_release()`. When the reference count hits zero, the tensor and its unreachable subgraph are freed using an iterative worklist, avoiding stack overflow on deep graphs.
 
 ```c
 Tensor* z = linear_forward(layer, x);    // z retains x internally
@@ -132,6 +133,16 @@ tensor_release(a);                        // frees a, then z (ref count -> 0)
 ```
 
 No garbage collector. No arena allocator. You own every allocation.
+
+### Safety and error contracts
+
+- Release each owned reference exactly once. `tensor_release(NULL)` is safe, but double-releasing a dangling pointer is not. Create tensors through the API rather than manually constructing or modifying their metadata/graph links.
+- Matrix dimensions must be positive and their element/allocation counts must fit the supported integer sizes. New data and gradient buffers are zero-initialized.
+- Invalid shapes and NULL operands return `NULL` from forward operations. Elementwise operations support equal shapes, a scalar with a matrix, or a `(1, cols)` row bias with `(rows, cols)` in either operand order. Unsupported shapes are rejected before indexing.
+- The core tensor/graph engine checks allocations and fails fast with a diagnostic on allocation failure or graph/reference-count overflow. Auxiliary constructors and the IDX loader return `NULL` on their own allocation failures. Callers must check returned pointers; the examples demonstrate cleanup on recoverable errors.
+- Optimizers borrow their parameter array and tensors. Keep both alive until the optimizer is no longer used, then free the array and release the owning model separately.
+- Keep tensor values unchanged between forward and backward. Ordinary math operations retain C floating-point behavior (including NaN/Inf for undefined domains); they do not clamp values.
+- The IDX loader checks dimensions, counts, labels and every read. It accepts dimensions other than 28x28; `train_mnist` checks for 784 features before indexing data.
 
 ---
 
@@ -163,6 +174,8 @@ Requires only `gcc` and `libm`. No `cmake`, no `configure`, no package manager.
 
 ```bash
 make                # builds: train, train_xor, train_mnist
+make check          # operation, ownership and malformed-input regression tests
+make check-sanitize # isolated ASan + UBSan builds, including leak detection
 make clean          # removes all build artifacts
 ```
 

@@ -6,7 +6,9 @@
 #include <math.h>
 
 //
-// Tensor object
+// Tensor object. Create through tensor_create*(); do not modify metadata,
+// graph links, or ref_count directly. Data/grad buffers are caller-accessible.
+// Keep data unchanged between forward and backward.
 //
 typedef struct Tensor {
     float* data;      // data buffer (scalar or matrix)
@@ -20,25 +22,31 @@ typedef struct Tensor {
     struct Tensor** parents;   // computation graph parents
     int n_parents;             // number of parents
 
-    int ref_count;             // Need to manage memory manually
+    int ref_count;             // caller owns one reference; graph edges retain parents
 
     void (*backward)(struct Tensor*);   // backward function
 } Tensor;
 
 //
-// Tensor creation
+// Tensor creation. Returned tensors own one caller reference. Matrix buffers
+// are zero-initialized. Invalid dimensions return NULL. The core engine uses
+// a fail-fast policy for allocation failure/graph-size/reference-count overflow:
+// it prints an error and exits rather than continuing with partial objects.
 //
 Tensor* tensor_create(float x);                 // scalar tensor
-Tensor* tensor_create_matrix(int rows, int cols);
+Tensor* tensor_create_matrix(int rows, int cols); // positive dimensions; NULL on invalid shape
 
 //
-// Memory management
+// Memory management. NULL is accepted. Release each owned reference once;
+// a released/dangling pointer must never be reused (including double release).
 //
 void tensor_retain(Tensor* t);
 void tensor_release(Tensor* t);
 
 //
-// Core ops (forward)
+// Core ops (forward). Invalid shapes/NULL inputs return NULL.
+// Binary elementwise ops accept equal shapes, scalar/matrix pairs, and
+// (rows, cols) with (1, cols) row-bias broadcasting in either order.
 //
 Tensor* tensor_add(Tensor* a, Tensor* b);
 Tensor* tensor_mul(Tensor* a, Tensor* b);
@@ -55,12 +63,9 @@ Tensor* tensor_sqrt(Tensor* a);
 //
 // Backward engine
 //
-void tensor_backward(Tensor* t);
+void tensor_backward(Tensor* t); // clears graph gradients; seeds sum(t) with ones
 
-//
-//Activation functions
-//
-Tensor* tensor_relu(Tensor* t);
+// Row-wise softmax of a 2D matrix; returns NULL for invalid input.
 Tensor* tensor_softmax(Tensor* t);
 
 //
