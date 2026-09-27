@@ -1,4 +1,5 @@
-#include "engine.h"
+#include "engine_internal.h"
+#include "kernels.h"
 
 #include <limits.h>
 #include <math.h>
@@ -55,6 +56,34 @@ static int valid_matrix_size(int rows, int cols, int *size_out) {
 
 static void report_error(const char *operation, const char *message) {
     fprintf(stderr, "minigrad: %s: %s\n", operation, message);
+}
+
+// Counters cover persistent engine-owned storage, not transient DFS buffers.
+static TensorMemoryStats memory_stats;
+static _Thread_local int gradient_enabled = 1;
+
+static void memory_add(size_t bytes) {
+    if (bytes > SIZE_MAX - memory_stats.live_bytes) {
+        fprintf(stderr, "minigrad: memory counter overflow\n");
+        exit(EXIT_FAILURE);
+    }
+    memory_stats.live_bytes += bytes;
+    if (memory_stats.live_bytes > memory_stats.peak_bytes)
+        memory_stats.peak_bytes = memory_stats.live_bytes;
+}
+
+static void memory_remove(size_t bytes) {
+    memory_stats.live_bytes -= bytes;
+}
+
+TensorMemoryStats tensor_memory_stats(void) { return memory_stats; }
+
+int grad_is_enabled(void) { return gradient_enabled; }
+
+int grad_set_enabled(int enabled) {
+    int previous = gradient_enabled;
+    gradient_enabled = !!enabled;
+    return previous;
 }
 
 // ============================================================
@@ -233,28 +262,34 @@ static void build_topo(Tensor *root, TensorList *topo) {
 // Tensor creation
 // ============================================================
 
-Tensor *tensor_create(float x) {
+Tensor *tensor_create_ex(float x, int requires_grad) {
     Tensor *tensor = checked_malloc(sizeof(Tensor));
-
     tensor->ndim = 0;
     tensor->shape = NULL;
     tensor->size = 1;
     tensor->data = checked_malloc(sizeof(float));
-    tensor->grad = checked_calloc(1, sizeof(float));
-
+    tensor->grad = requires_grad ? checked_calloc(1, sizeof(float)) : NULL;
     tensor->data[0] = x;
     tensor->parents = NULL;
     tensor->n_parents = 0;
     tensor->backward = NULL;
+    tensor->op_name = NULL;
+    tensor->requires_grad = !!requires_grad;
+    tensor->is_leaf = 1;
     tensor->ref_count = 1;
-
+    memory_stats.live_tensors++;
+    memory_add(sizeof(Tensor));
+    memory_add(sizeof(float));
+    if (tensor->grad) memory_add(sizeof(float));
     return tensor;
 }
 
-Tensor *tensor_create_matrix(int rows, int cols) {
+Tensor *tensor_create(float x) { return tensor_create_ex(x, 1); }
+
+Tensor *tensor_create_matrix_ex(int rows, int cols, int requires_grad) {
     int size;
     if (!valid_matrix_size(rows, cols, &size)) {
-        report_error("tensor_create_matrix", "dimensions must be positive and fit in int");
+        report_error("tensor_create_matrix_ex", "dimensions must be positive and fit in int");
         return NULL;
     }
 
@@ -264,18 +299,80 @@ Tensor *tensor_create_matrix(int rows, int cols) {
     tensor->shape[0] = rows;
     tensor->shape[1] = cols;
     tensor->size = size;
-
-    // Zero data as well as gradients. This makes partially constructed tensors
-    // deterministic if a caller fills only part of an input buffer.
     tensor->data = checked_calloc((size_t)size, sizeof(float));
-    tensor->grad = checked_calloc((size_t)size, sizeof(float));
-
+    tensor->grad = requires_grad ? checked_calloc((size_t)size, sizeof(float)) : NULL;
     tensor->parents = NULL;
     tensor->n_parents = 0;
     tensor->backward = NULL;
+    tensor->op_name = NULL;
+    tensor->requires_grad = !!requires_grad;
+    tensor->is_leaf = 1;
     tensor->ref_count = 1;
-
+    memory_stats.live_tensors++;
+    memory_add(sizeof(Tensor));
+    memory_add(2 * sizeof(int));
+    memory_add((size_t)size * sizeof(float));
+    if (tensor->grad) memory_add((size_t)size * sizeof(float));
     return tensor;
+}
+
+Tensor *tensor_create_matrix(int rows, int cols) {
+    return tensor_create_matrix_ex(rows, cols, 1);
+}
+
+int tensor_set_requires_grad(Tensor *tensor, int enabled) {
+    if (!tensor || !tensor->is_leaf || tensor->ref_count != 1 ||
+        tensor->n_parents != 0 || tensor->backward != NULL) return 0;
+    enabled = !!enabled;
+    if (enabled == tensor->requires_grad) return 1;
+    size_t bytes = (size_t)tensor->size * sizeof(float);
+    if (enabled) {
+        tensor->grad = checked_calloc((size_t)tensor->size, sizeof(float));
+        memory_add(bytes);
+    } else {
+        free(tensor->grad);
+        tensor->grad = NULL;
+        memory_remove(bytes);
+    }
+    tensor->requires_grad = enabled;
+    return 1;
+}
+
+int tensor_attach_operation(Tensor *out, Tensor *const *parents, int n_parents,
+                            void (*backward)(Tensor *), const char *op_name) {
+    if (!out || !parents || n_parents <= 0 || !backward || !op_name ||
+        !out->is_leaf || out->ref_count != 1 || out->n_parents != 0 ||
+        out->parents || out->backward ||
+        (size_t)n_parents > SIZE_MAX / sizeof(Tensor *)) return 0;
+    int tracked = 0;
+    for (int i = 0; i < n_parents; i++) {
+        if (!parents[i] || parents[i] == out) return 0;
+        tracked |= !!parents[i]->requires_grad;
+    }
+    tracked &= grad_is_enabled();
+    if (tracked) {
+        Tensor **links = checked_malloc((size_t)n_parents * sizeof(*links));
+        for (int i = 0; i < n_parents; i++) {
+            links[i] = parents[i];
+            tensor_retain(links[i]);
+        }
+        out->parents = links;
+        out->n_parents = n_parents;
+        out->backward = backward;
+        if (!out->grad) {
+            out->grad = checked_calloc((size_t)out->size, sizeof(float));
+            memory_add((size_t)out->size * sizeof(float));
+        }
+        memory_add((size_t)n_parents * sizeof(*links));
+    } else if (out->grad) {
+        free(out->grad);
+        out->grad = NULL;
+        memory_remove((size_t)out->size * sizeof(float));
+    }
+    out->requires_grad = tracked;
+    out->is_leaf = 0;
+    out->op_name = op_name;
+    return 1;
 }
 
 // ============================================================
@@ -327,6 +424,12 @@ void tensor_release(Tensor *tensor) {
             }
         }
 
+        memory_remove(sizeof(Tensor));
+        memory_remove((size_t)node->size * sizeof(float));
+        if (node->grad) memory_remove((size_t)node->size * sizeof(float));
+        if (node->shape) memory_remove(2 * sizeof(int));
+        if (node->parents) memory_remove((size_t)node->n_parents * sizeof(Tensor *));
+        memory_stats.live_tensors--;
         free(node->parents);
         free(node->data);
         free(node->grad);
@@ -341,82 +444,48 @@ void tensor_release(Tensor *tensor) {
 // Shape and broadcasting helpers
 // ============================================================
 
-typedef enum {
-    BINARY_INVALID,
-    BINARY_SCALAR,
-    BINARY_SAME_SHAPE,
-    BINARY_A_SCALAR,
-    BINARY_B_SCALAR,
-    BINARY_A_BIAS,
-    BINARY_B_BIAS
-} BinaryKind;
+typedef enum { BINARY_INVALID, BINARY_SCALAR, BINARY_MATRIX } BinaryKind;
 
 static BinaryKind binary_kind(const Tensor *a, const Tensor *b,
                               int *rows_out, int *cols_out) {
     if (!a || !b || !rows_out || !cols_out) return BINARY_INVALID;
-
     if (a->ndim == 0 && b->ndim == 0) {
-        *rows_out = 1;
-        *cols_out = 1;
+        *rows_out = *cols_out = 1;
         return BINARY_SCALAR;
     }
+    if ((a->ndim != 0 && a->ndim != 2) ||
+        (b->ndim != 0 && b->ndim != 2)) return BINARY_INVALID;
+    int ar = a->ndim == 0 ? 1 : a->shape[0];
+    int ac = a->ndim == 0 ? 1 : a->shape[1];
+    int br = b->ndim == 0 ? 1 : b->shape[0];
+    int bc = b->ndim == 0 ? 1 : b->shape[1];
+    if ((ar != br && ar != 1 && br != 1) ||
+        (ac != bc && ac != 1 && bc != 1)) return BINARY_INVALID;
+    *rows_out = ar > br ? ar : br;
+    *cols_out = ac > bc ? ac : bc;
+    int size;
+    return valid_matrix_size(*rows_out, *cols_out, &size) ? BINARY_MATRIX : BINARY_INVALID;
+}
 
-    if (a->ndim == 0 && b->ndim == 2) {
-        *rows_out = b->shape[0];
-        *cols_out = b->shape[1];
-        return BINARY_A_SCALAR;
-    }
-
-    if (a->ndim == 2 && b->ndim == 0) {
-        *rows_out = a->shape[0];
-        *cols_out = a->shape[1];
-        return BINARY_B_SCALAR;
-    }
-
-    if (a->ndim != 2 || b->ndim != 2) return BINARY_INVALID;
-
-    if (a->shape[0] == b->shape[0] && a->shape[1] == b->shape[1]) {
-        *rows_out = a->shape[0];
-        *cols_out = a->shape[1];
-        return BINARY_SAME_SHAPE;
-    }
-
-    // A row vector is the bias representation used by the neural-network
-    // layer: (batch, features) op (1, features).
-    if (b->shape[0] == 1 && b->shape[1] == a->shape[1]) {
-        *rows_out = a->shape[0];
-        *cols_out = a->shape[1];
-        return BINARY_B_BIAS;
-    }
-
-    if (a->shape[0] == 1 && a->shape[1] == b->shape[1]) {
-        *rows_out = b->shape[0];
-        *cols_out = b->shape[1];
-        return BINARY_A_BIAS;
-    }
-
-    return BINARY_INVALID;
+static int broadcast_index(const Tensor *tensor, int row, int col) {
+    if (tensor->ndim == 0) return 0;
+    return (tensor->shape[0] == 1 ? 0 : row) * tensor->shape[1] +
+           (tensor->shape[1] == 1 ? 0 : col);
 }
 
 static float broadcast_value(const Tensor *tensor, int row, int col,
                              int output_rows, int output_cols) {
-    if (tensor->ndim == 0) return tensor->data[0];
-    if (tensor->shape[0] == 1 && output_rows > 1) {
-        return tensor->data[col];
-    }
-    return tensor->data[row * output_cols + col];
+    (void)output_rows;
+    (void)output_cols;
+    return tensor->data[broadcast_index(tensor, row, col)];
 }
 
 static void accumulate_broadcast_grad(Tensor *tensor, int row, int col,
                                       int output_rows, int output_cols,
                                       float value) {
-    if (tensor->ndim == 0) {
-        tensor->grad[0] += value;
-    } else if (tensor->shape[0] == 1 && output_rows > 1) {
-        tensor->grad[col] += value;
-    } else {
-        tensor->grad[row * output_cols + col] += value;
-    }
+    (void)output_rows;
+    (void)output_cols;
+    if (tensor->grad) tensor->grad[broadcast_index(tensor, row, col)] += value;
 }
 
 static Tensor *create_binary_output(const char *operation,
@@ -431,9 +500,9 @@ static Tensor *create_binary_output(const char *operation,
 
     Tensor *output;
     if (kind == BINARY_SCALAR) {
-        output = tensor_create(0.0f);
+        output = tensor_create_ex(0.0f, 0);
     } else {
-        output = tensor_create_matrix(*rows_out, *cols_out);
+        output = tensor_create_matrix_ex(*rows_out, *cols_out, 0);
     }
 
     if (!output) return NULL;
@@ -441,24 +510,16 @@ static Tensor *create_binary_output(const char *operation,
     return output;
 }
 
-static void attach_binary_parents(Tensor *output, Tensor *a, Tensor *b,
-                                  void (*backward)(Tensor *)) {
-    output->parents = checked_malloc(2 * sizeof(Tensor *));
-    output->parents[0] = a;
-    output->parents[1] = b;
-    output->n_parents = 2;
-    tensor_retain(a);
-    tensor_retain(b);
-    output->backward = backward;
+static int attach_binary_parents(Tensor *output, Tensor *a, Tensor *b,
+                                 void (*backward)(Tensor *), const char *name) {
+    Tensor *parents[] = {a, b};
+    return tensor_attach_operation(output, parents, 2, backward, name);
 }
 
-static void attach_unary_parent(Tensor *output, Tensor *parent,
-                                void (*backward)(Tensor *)) {
-    output->parents = checked_malloc(sizeof(Tensor *));
-    output->parents[0] = parent;
-    output->n_parents = 1;
-    tensor_retain(parent);
-    output->backward = backward;
+static int attach_unary_parent(Tensor *output, Tensor *parent,
+                               void (*backward)(Tensor *), const char *name) {
+    Tensor *parents[] = {parent};
+    return tensor_attach_operation(output, parents, 1, backward, name);
 }
 
 // ============================================================
@@ -551,6 +612,7 @@ static void mean_backward(Tensor *self) {
     Tensor *a = self->parents[0];
     float grad = self->grad[0] / (float)a->size;
 
+    if (!a->grad) return;
     for (int i = 0; i < a->size; i++) {
         a->grad[i] += grad;
     }
@@ -570,17 +632,19 @@ static void pow_backward(Tensor *self) {
             float grad = self->grad[i * cols + j];
             float output_value = self->data[i * cols + j];
 
-            // d(a^b)/da is undefined at a=0 for some exponents. Avoid
-            // inventing a gradient in that case.
-            if (av != 0.0f) {
-                float da = bv * powf(av, bv - 1.0f) * grad;
+            // x^1 at x=0 has derivative 1, x^n for n>1 has
+            // derivative 0. Genuine singular/undefined domains follow libm.
+            if (a->grad) {
+                float da = av == 0.0f && bv == 0.0f ? 0.0f :
+                           av == 0.0f && bv == 1.0f ? 1.0f * grad :
+                           bv * powf(av, bv - 1.0f) * grad;
                 accumulate_broadcast_grad(a, i, j, rows, cols, da);
             }
-
-            // The derivative with respect to a continuous exponent is only
-            // defined for positive bases.
-            if (av > 0.0f) {
-                float db = output_value * logf(av) * grad;
+            if (b->grad) {
+                // At a=0 and b>0 the function is constant zero in b;
+                // avoid the otherwise indeterminate 0 * log(0).
+                float db = av == 0.0f && bv > 0.0f ? 0.0f :
+                           output_value * logf(av) * grad;
                 accumulate_broadcast_grad(b, i, j, rows, cols, db);
             }
         }
@@ -589,6 +653,7 @@ static void pow_backward(Tensor *self) {
 
 static void exp_backward(Tensor *self) {
     Tensor *a = self->parents[0];
+    if (!a->grad) return;
     for (int i = 0; i < self->size; i++) {
         a->grad[i] += self->data[i] * self->grad[i];
     }
@@ -596,6 +661,7 @@ static void exp_backward(Tensor *self) {
 
 static void tanh_backward(Tensor *self) {
     Tensor *a = self->parents[0];
+    if (!a->grad) return;
     for (int i = 0; i < self->size; i++) {
         float value = self->data[i];
         a->grad[i] += (1.0f - value * value) * self->grad[i];
@@ -604,6 +670,7 @@ static void tanh_backward(Tensor *self) {
 
 static void relu_backward(Tensor *self) {
     Tensor *a = self->parents[0];
+    if (!a->grad) return;
     for (int i = 0; i < self->size; i++) {
         if (self->data[i] > 0.0f) {
             a->grad[i] += self->grad[i];
@@ -613,6 +680,7 @@ static void relu_backward(Tensor *self) {
 
 static void sqrt_backward(Tensor *self) {
     Tensor *a = self->parents[0];
+    if (!a->grad) return;
     for (int i = 0; i < self->size; i++) {
         a->grad[i] += self->grad[i] / (2.0f * self->data[i]);
     }
@@ -625,29 +693,13 @@ static void matmul_backward(Tensor *self) {
     int n = a->shape[1];
     int k = b->shape[1];
 
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
-            float sum = 0.0f;
-            for (int p = 0; p < k; p++) {
-                sum += self->grad[i * k + p] * b->data[j * k + p];
-            }
-            a->grad[i * n + j] += sum;
-        }
-    }
-
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < k; j++) {
-            float sum = 0.0f;
-            for (int p = 0; p < m; p++) {
-                sum += a->data[p * n + i] * self->grad[p * k + j];
-            }
-            b->grad[i * k + j] += sum;
-        }
-    }
+    mg_matmul_backward(a->data, b->data, self->grad,
+                       a->grad, b->grad, m, n, k);
 }
 
 static void softmax_backward(Tensor *self) {
     Tensor *a = self->parents[0];
+    if (!a->grad) return;
     int rows = self->shape[0];
     int cols = self->shape[1];
 
@@ -683,7 +735,9 @@ Tensor *tensor_add(Tensor *a, Tensor *b) {
         }
     }
 
-    attach_binary_parents(c, a, b, add_backward);
+    if (!attach_binary_parents(c, a, b, add_backward, "add")) {
+        tensor_release(c); return NULL;
+    }
     return c;
 }
 
@@ -701,7 +755,9 @@ Tensor *tensor_sub(Tensor *a, Tensor *b) {
         }
     }
 
-    attach_binary_parents(c, a, b, sub_backward);
+    if (!attach_binary_parents(c, a, b, sub_backward, "sub")) {
+        tensor_release(c); return NULL;
+    }
     return c;
 }
 
@@ -719,7 +775,9 @@ Tensor *tensor_mul(Tensor *a, Tensor *b) {
         }
     }
 
-    attach_binary_parents(c, a, b, mul_backward);
+    if (!attach_binary_parents(c, a, b, mul_backward, "mul")) {
+        tensor_release(c); return NULL;
+    }
     return c;
 }
 
@@ -737,7 +795,9 @@ Tensor *tensor_div(Tensor *a, Tensor *b) {
         }
     }
 
-    attach_binary_parents(c, a, b, div_backward);
+    if (!attach_binary_parents(c, a, b, div_backward, "div")) {
+        tensor_release(c); return NULL;
+    }
     return c;
 }
 
@@ -755,7 +815,9 @@ Tensor *tensor_pow(Tensor *a, Tensor *b) {
         }
     }
 
-    attach_binary_parents(c, a, b, pow_backward);
+    if (!attach_binary_parents(c, a, b, pow_backward, "pow")) {
+        tensor_release(c); return NULL;
+    }
     return c;
 }
 
@@ -768,8 +830,10 @@ Tensor *tensor_mean(Tensor *a) {
     float sum = 0.0f;
     for (int i = 0; i < a->size; i++) sum += a->data[i];
 
-    Tensor *c = tensor_create(sum / (float)a->size);
-    attach_unary_parent(c, a, mean_backward);
+    Tensor *c = tensor_create_ex(sum / (float)a->size, 0);
+    if (!attach_unary_parent(c, a, mean_backward, "mean")) {
+        tensor_release(c); return NULL;
+    }
     return c;
 }
 
@@ -781,9 +845,9 @@ Tensor *tensor_sqrt(Tensor *a) {
 
     Tensor *c;
     if (a->ndim == 0) {
-        c = tensor_create(sqrtf(a->data[0]));
+        c = tensor_create_ex(sqrtf(a->data[0]), 0);
     } else if (a->ndim == 2) {
-        c = tensor_create_matrix(a->shape[0], a->shape[1]);
+        c = tensor_create_matrix_ex(a->shape[0], a->shape[1], 0);
         if (!c) return NULL;
         for (int i = 0; i < a->size; i++) c->data[i] = sqrtf(a->data[i]);
     } else {
@@ -791,7 +855,9 @@ Tensor *tensor_sqrt(Tensor *a) {
         return NULL;
     }
 
-    attach_unary_parent(c, a, sqrt_backward);
+    if (!attach_unary_parent(c, a, sqrt_backward, "sqrt")) {
+        tensor_release(c); return NULL;
+    }
     return c;
 }
 
@@ -803,9 +869,9 @@ Tensor *tensor_expn(Tensor *a) {
 
     Tensor *c;
     if (a->ndim == 0) {
-        c = tensor_create(expf(a->data[0]));
+        c = tensor_create_ex(expf(a->data[0]), 0);
     } else if (a->ndim == 2) {
-        c = tensor_create_matrix(a->shape[0], a->shape[1]);
+        c = tensor_create_matrix_ex(a->shape[0], a->shape[1], 0);
         if (!c) return NULL;
         for (int i = 0; i < a->size; i++) c->data[i] = expf(a->data[i]);
     } else {
@@ -813,7 +879,9 @@ Tensor *tensor_expn(Tensor *a) {
         return NULL;
     }
 
-    attach_unary_parent(c, a, exp_backward);
+    if (!attach_unary_parent(c, a, exp_backward, "exp")) {
+        tensor_release(c); return NULL;
+    }
     return c;
 }
 
@@ -825,9 +893,9 @@ Tensor *tensor_Tanh(Tensor *a) {
 
     Tensor *c;
     if (a->ndim == 0) {
-        c = tensor_create(tanhf(a->data[0]));
+        c = tensor_create_ex(tanhf(a->data[0]), 0);
     } else if (a->ndim == 2) {
-        c = tensor_create_matrix(a->shape[0], a->shape[1]);
+        c = tensor_create_matrix_ex(a->shape[0], a->shape[1], 0);
         if (!c) return NULL;
         for (int i = 0; i < a->size; i++) c->data[i] = tanhf(a->data[i]);
     } else {
@@ -835,7 +903,9 @@ Tensor *tensor_Tanh(Tensor *a) {
         return NULL;
     }
 
-    attach_unary_parent(c, a, tanh_backward);
+    if (!attach_unary_parent(c, a, tanh_backward, "tanh")) {
+        tensor_release(c); return NULL;
+    }
     return c;
 }
 
@@ -847,9 +917,9 @@ Tensor *tensor_relu(Tensor *a) {
 
     Tensor *c;
     if (a->ndim == 0) {
-        c = tensor_create(a->data[0] > 0.0f ? a->data[0] : 0.0f);
+        c = tensor_create_ex(a->data[0] > 0.0f ? a->data[0] : 0.0f, 0);
     } else if (a->ndim == 2) {
-        c = tensor_create_matrix(a->shape[0], a->shape[1]);
+        c = tensor_create_matrix_ex(a->shape[0], a->shape[1], 0);
         if (!c) return NULL;
         for (int i = 0; i < a->size; i++) {
             c->data[i] = a->data[i] > 0.0f ? a->data[i] : 0.0f;
@@ -859,7 +929,9 @@ Tensor *tensor_relu(Tensor *a) {
         return NULL;
     }
 
-    attach_unary_parent(c, a, relu_backward);
+    if (!attach_unary_parent(c, a, relu_backward, "relu")) {
+        tensor_release(c); return NULL;
+    }
     return c;
 }
 
@@ -871,7 +943,7 @@ Tensor *tensor_softmax(Tensor *a) {
 
     int rows = a->shape[0];
     int cols = a->shape[1];
-    Tensor *c = tensor_create_matrix(rows, cols);
+    Tensor *c = tensor_create_matrix_ex(rows, cols, 0);
     if (!c) return NULL;
 
     for (int i = 0; i < rows; i++) {
@@ -915,7 +987,9 @@ Tensor *tensor_softmax(Tensor *a) {
         }
     }
 
-    attach_unary_parent(c, a, softmax_backward);
+    if (!attach_unary_parent(c, a, softmax_backward, "softmax")) {
+        tensor_release(c); return NULL;
+    }
     return c;
 }
 
@@ -935,20 +1009,13 @@ Tensor *tensor_matmul(Tensor *a, Tensor *b) {
         return NULL;
     }
 
-    Tensor *c = tensor_create_matrix(m, k);
+    Tensor *c = tensor_create_matrix_ex(m, k, 0);
     if (!c) return NULL;
+    mg_matmul_forward(a->data, b->data, c->data, m, n, k);
 
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < k; j++) {
-            float sum = 0.0f;
-            for (int p = 0; p < n; p++) {
-                sum += a->data[i * n + p] * b->data[p * k + j];
-            }
-            c->data[i * k + j] = sum;
-        }
+    if (!attach_binary_parents(c, a, b, matmul_backward, "matmul")) {
+        tensor_release(c); return NULL;
     }
-
-    attach_binary_parents(c, a, b, matmul_backward);
     return c;
 }
 
@@ -956,35 +1023,44 @@ Tensor *tensor_matmul(Tensor *a, Tensor *b) {
 // Autograd engine
 // ============================================================
 
-void tensor_backward(Tensor *tensor) {
-    if (!tensor) {
-        report_error("tensor_backward", "input is NULL");
-        return;
-    }
+int tensor_backward_with_grad(Tensor *tensor, const Tensor *upstream) {
+    if (!tensor || !tensor->requires_grad || !tensor->grad ||
+        (upstream && (!upstream->data || tensor->ndim != upstream->ndim ||
+                      tensor->size != upstream->size ||
+                      (tensor->ndim == 2 &&
+                       (!tensor->shape || !upstream->shape ||
+                        tensor->shape[0] != upstream->shape[0] ||
+                        tensor->shape[1] != upstream->shape[1]))))) return 0;
 
+    // The seed may alias an intermediate or leaf gradient, including the
+    // root's own gradient. Snapshot it before zeroing any intermediate.
+    float *seed = NULL;
+    if (upstream) {
+        seed = checked_malloc((size_t)tensor->size * sizeof(float));
+        for (int i = 0; i < tensor->size; i++) seed[i] = upstream->data[i];
+    }
     TensorList topo;
     list_init(&topo);
     build_topo(tensor, &topo);
-
-    // Each call computes a fresh vector-Jacobian product. Gradients from a
-    // previous call are cleared before seeding the output gradient.
     for (int i = 0; i < topo.size; i++) {
-        tensor_zero_grad(topo.items[i]);
+        if (!topo.items[i]->is_leaf) tensor_zero_grad(topo.items[i]);
     }
-
-    if (tensor->size == 1) {
-        tensor->grad[0] = 1.0f;
-    } else {
-        // For a non-scalar output this computes the gradient of sum(output).
-        for (int i = 0; i < tensor->size; i++) tensor->grad[i] = 1.0f;
+    for (int i = 0; i < tensor->size; i++) {
+        if (tensor->is_leaf) tensor->grad[i] += seed ? seed[i] : 1.0f;
+        else tensor->grad[i] = seed ? seed[i] : 1.0f;
     }
-
     for (int i = topo.size - 1; i >= 0; i--) {
         Tensor *node = topo.items[i];
-        if (node->backward) node->backward(node);
+        if (node->backward && node->grad) node->backward(node);
     }
-
     list_free(&topo);
+    free(seed);
+    return 1;
+}
+
+void tensor_backward(Tensor *tensor) {
+    if (!tensor_backward_with_grad(tensor, NULL))
+        report_error("tensor_backward", "invalid or non-trainable output");
 }
 
 // ============================================================

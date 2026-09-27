@@ -1,55 +1,80 @@
-
-CC      = gcc
-CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic -g -O2 -Iinclude
-LDFLAGS = -lm
+CC ?= cc
+AR ?= ar
+CPPFLAGS += -Iinclude
+CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -g -O2
+LDFLAGS ?=
+LDLIBS ?= -lm
 SANFLAGS = -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -O1 -g
-VPATH   = src:examples:tests
-HEADERS = $(wildcard include/*.h)
-LIBSRC  = $(wildcard src/*.c)
 
-all: train train_xor train_mnist
+LIBSRC := $(wildcard src/*.c)
+LIBOBJ := $(patsubst src/%.c,build/normal/src/%.o,$(LIBSRC))
+SANOBJ := $(patsubst src/%.c,build/sanitize/src/%.o,$(LIBSRC))
+TESTSRC := $(wildcard tests/test*.c)
+TESTS := $(patsubst tests/%.c,%,$(TESTSRC))
+SANTESTS := $(addsuffix _sanitize,$(TESTS))
+EXAMPLES := train train_xor train_mnist
+EXAMPLEOBJ := $(addprefix build/normal/examples/,$(addsuffix .o,$(EXAMPLES)))
+TESTOBJ := $(patsubst tests/%.c,build/normal/tests/%.o,$(TESTSRC))
+SANTESTOBJ := $(patsubst tests/%.c,build/sanitize/tests/%.o,$(TESTSRC))
+BENCHSRC := $(wildcard benchmarks/bench_matmul.c)
+BENCHOBJ := $(patsubst benchmarks/%.c,build/normal/benchmarks/%.o,$(BENCHSRC))
 
-.PHONY: all check check-sanitize clean
+.PHONY: all check check-sanitize bench clean
+all: libminigrad.a $(EXAMPLES)
 
-check: test test_engine test_safety
-	./test
-	./test_engine
-	./test_safety
+libminigrad.a: $(LIBOBJ)
+	$(AR) rcs $@ $^
 
-# Build separately so sanitizer and normal object files never get mixed.
-check-sanitize: test_sanitize test_engine_sanitize test_safety_sanitize
-	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./test_sanitize
-	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./test_engine_sanitize
-	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./test_safety_sanitize
+# Keep assertion checks active even when the caller passes CFLAGS=-DNDEBUG.
+build/normal/tests/%.o: tests/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG -MMD -MP -c $< -o $@
 
-train: train.o engine.o nn.o mlp.o loss.o optim.o
-	$(CC) $(CFLAGS) -o train train.o engine.o nn.o mlp.o loss.o optim.o $(LDFLAGS)
+build/sanitize/tests/%.o: tests/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG $(SANFLAGS) -MMD -MP -c $< -o $@
 
-train_xor: train_xor.o engine.o nn.o mlp.o loss.o optim.o
-	$(CC) $(CFLAGS) -o train_xor train_xor.o engine.o nn.o mlp.o loss.o optim.o $(LDFLAGS)
+build/normal/src/%.o: src/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-train_mnist: train_mnist.o engine.o nn.o mlp.o loss.o optim.o mnist_loader.o
-	$(CC) $(CFLAGS) -o train_mnist train_mnist.o engine.o nn.o mlp.o loss.o optim.o mnist_loader.o $(LDFLAGS)
+build/sanitize/src/%.o: src/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SANFLAGS) -MMD -MP -c $< -o $@
 
-test: test.o engine.o
-	$(CC) $(CFLAGS) -o test test.o engine.o $(LDFLAGS)
+build/normal/examples/%.o: examples/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-test_engine: test_engine.o engine.o loss.o
-	$(CC) $(CFLAGS) -o test_engine test_engine.o engine.o loss.o $(LDFLAGS)
+build/normal/benchmarks/%.o: benchmarks/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-test_safety: test_safety.o engine.o loss.o nn.o mlp.o optim.o mnist_loader.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(EXAMPLES): %: build/normal/examples/%.o libminigrad.a
+	$(CC) $(LDFLAGS) -o $@ $< libminigrad.a $(LDLIBS)
 
-# Keep assertions active even in builds configured with -DNDEBUG.
-test.o test_engine.o test_safety.o: CFLAGS += -UNDEBUG
+$(TESTS): %: build/normal/tests/%.o libminigrad.a
+	$(CC) $(LDFLAGS) -o $@ $< libminigrad.a $(LDLIBS)
 
-%_sanitize: tests/%.c $(LIBSRC) $(HEADERS)
-	$(CC) $(CFLAGS) -UNDEBUG $(SANFLAGS) -o $@ $(filter %.c,$^) $(LDFLAGS) $(SANFLAGS)
+$(SANTESTS): %_sanitize: build/sanitize/tests/%.o $(SANOBJ)
+	$(CC) $(LDFLAGS) $(SANFLAGS) -o $@ $^ $(LDLIBS)
 
-%.o: %.c
-	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+check: $(TESTS)
+	@set -e; $(foreach test,$(TESTS),./$(test);)
 
--include $(wildcard *.d)
+check-sanitize: $(SANTESTS)
+	@set -e; $(foreach test,$(SANTESTS),ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./$(test);)
+
+# The benchmark uses the same reusable library as examples and tests.
+bench: bench_matmul
+	./bench_matmul
+
+ifneq ($(BENCHSRC),)
+bench_matmul: build/normal/benchmarks/bench_matmul.o libminigrad.a
+	$(CC) $(LDFLAGS) -o $@ $< libminigrad.a $(LDLIBS)
+endif
+
+-include $(LIBOBJ:.o=.d) $(SANOBJ:.o=.d) $(TESTOBJ:.o=.d) $(SANTESTOBJ:.o=.d) $(EXAMPLEOBJ:.o=.d) $(BENCHOBJ:.o=.d)
 
 clean:
-	rm -f *.o *.d train test test_engine test_safety *_sanitize train_xor train_mnist
+	rm -rf build libminigrad.a $(EXAMPLES) $(TESTS) $(SANTESTS) bench_matmul

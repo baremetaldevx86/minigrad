@@ -1,6 +1,10 @@
 *.o
 *.d
 *_sanitize
+build/
+libminigrad.a
+bench_matmul
+/test_*
 test_safety
 train
 test

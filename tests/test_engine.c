@@ -33,6 +33,7 @@ static void test_broadcasting_and_bias(void) {
     expect_close(scalar->grad[0], 6.0f);
     tensor_release(sum);
 
+    tensor_zero_grad(matrix); // Each backward below checks one independent graph.
     Tensor *scalar_left = tensor_create(2.0f);
     Tensor *scalar_sum = tensor_add(scalar_left, matrix);
     const float scalar_sum_expected[] = {3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
@@ -42,6 +43,7 @@ static void test_broadcasting_and_bias(void) {
     for (int i = 0; i < matrix->size; i++) expect_close(matrix->grad[i], 1.0f);
     tensor_release(scalar_sum);
 
+    tensor_zero_grad(matrix);
     Tensor *bias = tensor_create_matrix(1, 3);
     bias->data[0] = 0.5f;
     bias->data[1] = -1.0f;
@@ -55,6 +57,8 @@ static void test_broadcasting_and_bias(void) {
 
     tensor_release(biased);
 
+    tensor_zero_grad(matrix);
+    tensor_zero_grad(bias);
     Tensor *scaled = tensor_mul(bias, matrix); // Reverse bias broadcasting.
     const float scaled_expected[] = {0.5f, -2.0f, 6.0f,
                                       2.0f, -5.0f, 12.0f};
@@ -69,6 +73,8 @@ static void test_broadcasting_and_bias(void) {
     }
     tensor_release(scaled);
 
+    tensor_zero_grad(matrix);
+    tensor_zero_grad(scalar);
     Tensor *quotient = tensor_div(matrix, scalar);
     const float quotient_expected[] = {0.1f, 0.2f, 0.3f,
                                         0.4f, 0.5f, 0.6f};
@@ -210,7 +216,11 @@ static void test_losses(void) {
     expect_close(logits->grad[3], -1.0f / 3.0f);
     expect_close(logits->grad[4], 1.0f / 6.0f);
     expect_close(logits->grad[5], 1.0f / 6.0f);
-    for (int i = 0; i < labels->size; i++) expect_close(labels->grad[i], 0.0f);
+    float first_log_normalizer = logf(normalizer);
+    for (int i = 0; i < 3; i++) {
+        expect_close(labels->grad[i], (first_log_normalizer - logits->data[i]) / 2.0f);
+        expect_close(labels->grad[i + 3], logf(3.0f) / 2.0f);
+    }
 
     tensor_release(cross_entropy);
     tensor_release(labels);
@@ -227,6 +237,8 @@ static void test_losses(void) {
     float second_probability = 1.0f / (expf(1.0f) + 1.0f);
     expect_close(large_logits->grad[0], -second_probability);
     expect_close(large_logits->grad[1], second_probability);
+    expect_close(large_labels->grad[0], log1pf(expf(-1.0f)));
+    expect_close(large_labels->grad[1], 1.0f + log1pf(expf(-1.0f)));
     tensor_release(stable_loss);
     tensor_release(large_labels);
     tensor_release(large_logits);

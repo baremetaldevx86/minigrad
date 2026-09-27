@@ -81,6 +81,7 @@ static void test_softmax_and_loss_errors(void) {
     assert(logits->grad[0] == -0.25f && logits->grad[1] == 0.25f);
     tensor_release(loss);
 
+    tensor_zero_grad(logits); // Leaf gradients accumulate across separate graphs.
     Tensor *probabilities = tensor_softmax(logits);
     Tensor *weighted = tensor_mul(probabilities, targets);
     assert(probabilities && weighted);
@@ -127,9 +128,9 @@ static void test_model_lifetimes(void) {
     assert(params && count == 4);
     SGD *opt = sgd_create(params, count, 0.1f);
     assert(opt);
-    Tensor *input = tensor_create_matrix(3, 2);
-    Tensor *target = tensor_create_matrix(3, 1);
-    Tensor *wrong = tensor_create_matrix(2, 3);
+    Tensor *input = tensor_create_matrix_ex(3, 2, 0);
+    Tensor *target = tensor_create_matrix_ex(3, 1, 0);
+    Tensor *wrong = tensor_create_matrix_ex(2, 3, 0);
     for (int i = 0; i < 20; i++) {
         assert(!mlp_forward(model, wrong, 1));
         assert(wrong->ref_count == 1);

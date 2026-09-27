@@ -34,10 +34,11 @@ static void shuffle_indices(int* idx, int n) {
 static float compute_accuracy(MLP* model, MNISTData* data) {
     int correct = 0;
     int n = data->n_samples;
+    int prior_mode = grad_set_enabled(0);
+    float accuracy = NAN;
 
-    Tensor* X = tensor_create_matrix(EVAL_BATCH, 784);
-
-    if (!X) return NAN;
+    Tensor* X = tensor_create_matrix_ex(EVAL_BATCH, 784, 0);
+    if (!X) goto cleanup;
     for (int i = 0; i < n; ) {
         int bs = (n - i < EVAL_BATCH) ? (n - i) : EVAL_BATCH;
 
@@ -49,12 +50,9 @@ static float compute_accuracy(MLP* model, MNISTData* data) {
             }
         }
 
-        /* Forward (no backward called → safe) */
+        /* Forward in no-grad mode: evaluation builds no parameter graph. */
         Tensor* logits = mlp_forward(model, X, 1);
-        if (!logits) {
-            tensor_release(X);
-            return NAN;
-        }
+        if (!logits) goto cleanup;
 
         for (int b = 0; b < bs; b++) {
             int pred = 0;
@@ -76,8 +74,11 @@ static float compute_accuracy(MLP* model, MNISTData* data) {
         i += bs;
     }
 
+    accuracy = (float)correct / (float)n;
+cleanup:
     tensor_release(X);
-    return (float)correct / (float)n;
+    grad_set_enabled(prior_mode);
+    return accuracy;
 }
 
 /* =================== MAIN =================== */
@@ -133,8 +134,8 @@ int main(void) {
            EPOCHS, BATCH_SIZE, BASE_LR);
 
     /* Training buffers */
-    X = tensor_create_matrix(BATCH_SIZE, 784);
-    Y = tensor_create_matrix(BATCH_SIZE, 10);
+    X = tensor_create_matrix_ex(BATCH_SIZE, 784, 0);
+    Y = tensor_create_matrix_ex(BATCH_SIZE, 10, 0);
     if (!X || !Y) goto cleanup;
 
     /* Loader already verified n_samples * sizeof(int) fits size_t. */

@@ -1,5 +1,7 @@
 #include "loss.h"
+#include "engine_internal.h"
 
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
@@ -36,54 +38,38 @@ Tensor *mse_loss(Tensor *y_pred, Tensor *y_true) {
  * ============================================================ */
 
 static void cross_entropy_backward(Tensor *loss) {
-    if (!loss || !loss->parents || loss->n_parents != 2 ||
-        !loss->parents[0] || !loss->parents[1] || !loss->grad) {
-        return;
-    }
-
     Tensor *logits = loss->parents[0];
     Tensor *targets = loss->parents[1];
-    if (logits->ndim != 2 || targets->ndim != 2 || !logits->shape ||
-        !targets->shape || !logits->data || !targets->data || !logits->grad ||
-        logits->shape[0] <= 0 || logits->shape[1] <= 0 ||
-        targets->shape[0] != logits->shape[0] ||
-        targets->shape[1] != logits->shape[1] ||
-        logits->shape[0] > INT_MAX / logits->shape[1] ||
-        logits->size != logits->shape[0] * logits->shape[1] ||
-        targets->size != logits->size) {
-        return;
-    }
-
     int batch_size = logits->shape[0];
     int n_classes = logits->shape[1];
+    double seed = (double)loss->grad[0] / (double)batch_size;
 
     for (int i = 0; i < batch_size; i++) {
-        float max_value = -INFINITY;
+        int row = i * n_classes;
+        double max_value = -INFINITY;
+        double target_sum = 0.0;
         for (int j = 0; j < n_classes; j++) {
-            float value = logits->data[i * n_classes + j];
-            if (!isfinite(value)) return;
+            double value = logits->data[row + j];
             if (value > max_value) max_value = value;
+            target_sum += targets->data[row + j];
         }
+        double sum_exp = 0.0;
+        for (int j = 0; j < n_classes; j++)
+            sum_exp += exp((double)logits->data[row + j] - max_value);
+        double log_sum_exp = log(sum_exp);
 
-        float sum_exp = 0.0f;
         for (int j = 0; j < n_classes; j++) {
-            sum_exp += expf(logits->data[i * n_classes + j] - max_value);
-        }
-        if (!(sum_exp > 0.0f) || !isfinite(sum_exp)) return;
-
-        float target_sum = 0.0f;
-        for (int j = 0; j < n_classes; j++) {
-            float target = targets->data[i * n_classes + j];
-            if (!isfinite(target)) return;
-            target_sum += target;
-        }
-        for (int j = 0; j < n_classes; j++) {
-            float target = targets->data[i * n_classes + j];
-            float probability =
-                expf(logits->data[i * n_classes + j] - max_value) / sum_exp;
-            float update = (probability * target_sum - target) * loss->grad[0] /
-                           (float)batch_size;
-            logits->grad[i * n_classes + j] += update;
+            int k = row + j;
+            if (logits->requires_grad && logits->grad) {
+                double probability = exp((double)logits->data[k] - max_value) / sum_exp;
+                logits->grad[k] += (float)(seed *
+                    (probability * target_sum - (double)targets->data[k]));
+            }
+            if (targets->requires_grad && targets->grad) {
+                double log_probability =
+                    (double)logits->data[k] - max_value - log_sum_exp;
+                targets->grad[k] -= (float)(seed * log_probability);
+            }
         }
     }
 }
@@ -104,12 +90,13 @@ Tensor *cross_entropy_loss(Tensor *logits, Tensor *targets) {
 
     int batch_size = logits->shape[0];
     int n_classes = logits->shape[1];
-    float total_loss = 0.0f;
+    double total_loss = 0.0;
 
     for (int i = 0; i < batch_size; i++) {
-        float max_value = -INFINITY;
+        int row = i * n_classes;
+        double max_value = -INFINITY;
         for (int j = 0; j < n_classes; j++) {
-            float value = logits->data[i * n_classes + j];
+            double value = logits->data[row + j];
             if (!isfinite(value)) {
                 fprintf(stderr,
                         "minigrad: cross_entropy_loss: logits must be finite\n");
@@ -118,48 +105,35 @@ Tensor *cross_entropy_loss(Tensor *logits, Tensor *targets) {
             if (value > max_value) max_value = value;
         }
 
-        float sum_exp = 0.0f;
+        double sum_exp = 0.0;
+        for (int j = 0; j < n_classes; j++)
+            sum_exp += exp((double)logits->data[row + j] - max_value);
+        double log_sum_exp = log(sum_exp);
         for (int j = 0; j < n_classes; j++) {
-            sum_exp += expf(logits->data[i * n_classes + j] - max_value);
-        }
-        if (!(sum_exp > 0.0f) || !isfinite(sum_exp)) {
-            fprintf(stderr,
-                    "minigrad: cross_entropy_loss: invalid softmax normalization\n");
-            return NULL;
-        }
-
-        float log_sum_exp = logf(sum_exp);
-        for (int j = 0; j < n_classes; j++) {
-            float target = targets->data[i * n_classes + j];
-            if (!isfinite(target) || target < 0.0f) {
+            double target = targets->data[row + j];
+            if (!isfinite(target) || target < 0.0) {
                 fprintf(stderr,
                         "minigrad: cross_entropy_loss: targets must be finite and non-negative\n");
                 return NULL;
             }
-            float log_probability =
-                (logits->data[i * n_classes + j] - max_value) - log_sum_exp;
+            double log_probability =
+                (double)logits->data[row + j] - max_value - log_sum_exp;
             total_loss -= target * log_probability;
         }
     }
 
-    if (!isfinite(total_loss)) {
-        fprintf(stderr, "minigrad: cross_entropy_loss: non-finite loss\n");
+    double mean_loss = total_loss / (double)batch_size;
+    if (!isfinite(mean_loss) || mean_loss > FLT_MAX || mean_loss < -FLT_MAX) {
+        fprintf(stderr, "minigrad: cross_entropy_loss: loss exceeds float range\n");
         return NULL;
     }
-    Tensor *loss = tensor_create(total_loss / (float)batch_size);
+    Tensor *loss = tensor_create_ex((float)mean_loss, 0);
     if (!loss) return NULL;
-
-    loss->parents = (Tensor **)malloc(2 * sizeof(*loss->parents));
-    if (!loss->parents) {
+    Tensor *parents[] = {logits, targets};
+    if (!tensor_attach_operation(loss, parents, 2, cross_entropy_backward,
+                                 "cross_entropy")) {
         tensor_release(loss);
-        fprintf(stderr, "minigrad: cross_entropy_loss: out of memory\n");
         return NULL;
     }
-    loss->parents[0] = logits;
-    loss->parents[1] = targets;
-    loss->n_parents = 2;
-    tensor_retain(logits);
-    tensor_retain(targets);
-    loss->backward = cross_entropy_backward;
     return loss;
 }

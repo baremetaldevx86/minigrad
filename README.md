@@ -1,280 +1,86 @@
 # minigrad
 
-A from-scratch automatic differentiation engine written in pure C. No frameworks. No dependencies. No Python. Just raw C, manual memory management, and reverse-mode autodiff.
-
-Trains a 3-layer MLP on MNIST from raw pixels and reaches **98.01% test accuracy** -- using only the C library and `libm`.
+A small dependency-free C11 reverse-mode autodiff engine for scalars and contiguous 2D matrices. The repository includes an MLP, MNIST IDX loader, optimizers, numerical gradient checking, safe checkpoints, diagnostics and a matmul benchmark. The original 784→256→128→10 MNIST training run reported **98.01% test accuracy** (SGD, 20 epochs, batch 32); this is a historical example result, not a benchmark of the current kernels.
 
 <img width="823" height="780" alt="mnist-training" src="https://github.com/user-attachments/assets/bc408345-be08-4b17-a631-2288f440e64d" />
 
----
+## Build and run
 
-## Why This Exists
+Requires a C11 compiler and `libm`, with no third-party libraries. Checkpoint persistence and temporary-file tests use POSIX filesystem APIs (for example Linux/macOS). `make` also produces `libminigrad.a` for linking your own programs.
 
-Every deep learning framework hides the autograd behind thousands of lines of abstraction. rawgrad does not.
-
-The differentiation engine lives in a single C file. Every tensor tracks its parents in a dynamically constructed computation graph. Calling `tensor_backward()` topologically sorts that graph and walks it in reverse, invoking each node's backward kernel. Gradients accumulate via the chain rule. That is the whole engine.
-
-Everything else -- linear layers, MLP, loss functions, the optimizer -- is built directly on top of those primitives.
-
----
-
-## Features
-
-- **Reverse-mode automatic differentiation** with dynamic computation graph
-- **13 differentiable operations** with hand-written forward and backward kernels
-- **Matrix operations** including batched matmul with correct gradient computation
-- **Fused softmax cross-entropy loss** for numerical stability (log-sum-exp trick)
-- **He weight initialization** (Kaiming) via Box-Muller normal sampling
-- **Manual reference-counted memory management** -- no GC, no arenas
-- **SGD optimizer** with step-decay learning rate scheduling
-- **MNIST data loader** that reads raw IDX binary format
-- **Zero external dependencies** -- only `gcc` and `libm`
-
----
-
-## Results
-
-### MNIST
-
-Architecture: `784 -> 256 -> 128 -> 10` (ReLU activations, softmax cross-entropy loss)
-
-| Metric | Value |
-|---|---|
-| Test Accuracy | **98.01%** |
-| Parameters | 235,146 |
-| Optimizer | SGD (lr=0.02, step decay) |
-| Batch Size | 32 |
-| Epochs | 20 |
-
-### XOR
-
-Architecture: `2 -> 4 -> 1` (Tanh activation, MSE loss)
-
-Converges to near-zero loss in 5,000 epochs, correctly classifying all four XOR inputs.
-
----
-
-## Architecture
-
-```
-src/
-  engine.c            -- core tensor type, forward/backward ops, autograd
-  nn.c                -- linear layer (y = xW + b), He init
-  mlp.c               -- multi-layer perceptron
-  loss.c              -- MSE loss, fused softmax cross-entropy
-  optim.c             -- SGD optimizer
-  mnist_loader.c      -- checked IDX binary format parser
-
-include/
-  engine.h  nn.h  mlp.h  loss.h  optim.h  mnist_loader.h
-
-examples/
-  train.c             -- minimal training demo
-  train_xor.c         -- XOR classification
-  train_mnist.c       -- full MNIST training loop
-
-tests/
-  test.c              -- sqrt smoke test
-  test_engine.c       -- operation, gradient, broadcasting and loss regressions
-  test_safety.c       -- deep graphs, ownership, invalid inputs and IDX failures
-```
-
----
-
-## Supported Operations
-
-Every operation has both a forward kernel and a hand-written backward kernel.
-
-| Operation | Signature | Backward |
-|---|---|---|
-| Addition | `tensor_add(a, b)` | dL/da += dL/dc, dL/db += dL/dc (with bias broadcast) |
-| Subtraction | `tensor_sub(a, b)` | dL/da += dL/dc, dL/db -= dL/dc |
-| Multiplication | `tensor_mul(a, b)` | dL/da += b * dL/dc, dL/db += a * dL/dc |
-| Division | `tensor_div(a, b)` | dL/da += dL/dc / b, dL/db += -a * dL/dc / b^2 |
-| Power | `tensor_pow(a, b)` | Chain rule with scalar exponent support |
-| Matrix Multiply | `tensor_matmul(A, B)` | dA = dC @ B^T, dB = A^T @ dC |
-| Exponential | `tensor_expn(a)` | dL/da += exp(a) * dL/dc |
-| Square Root | `tensor_sqrt(a)` | dL/da += dL/dc / (2 * sqrt(a)) |
-| Mean | `tensor_mean(a)` | dL/da_i += dL/dc / n |
-| ReLU | `tensor_relu(a)` | dL/da += dL/dc if a > 0, else 0 |
-| Tanh | `tensor_Tanh(a)` | dL/da += (1 - tanh^2(a)) * dL/dc |
-| Softmax | `tensor_softmax(a)` | Row-wise Jacobian-vector product |
-| Cross-Entropy | `cross_entropy_loss(logits, targets)` | dL/dz = (softmax(z) - y) / batch_size |
-
----
-
-## How the Autograd Works
-
-```
-1. Forward pass builds a DAG of Tensor nodes
-2. Each operation creates a new Tensor that stores pointers to its parents
-3. tensor_backward() is called on the loss node:
-   a. Topological sort of the full computation graph
-   b. Seed the loss gradient to 1.0
-   c. Walk nodes in reverse topological order
-   d. Each node calls its backward function pointer
-   e. Gradients accumulate into parent .grad buffers via the chain rule
-```
-
-The topological sort uses an iterative DFS with a dynamically sized pointer set. The backward pass is a single linear sweep over the sorted list. Each call clears gradients throughout the reachable graph; non-scalar outputs seed all elements with one, computing the gradient of their sum.
-
----
-
-## Memory Model
-
-Tensors use **manual reference counting**. Every operation that creates a new tensor calls `tensor_retain()` on its parents. When you are done with a tensor, call `tensor_release()`. When the reference count hits zero, the tensor and its unreachable subgraph are freed using an iterative worklist, avoiding stack overflow on deep graphs.
-
-```c
-Tensor* z = linear_forward(layer, x);    // z retains x internally
-Tensor* a = tensor_relu(z);              // a retains z internally
-tensor_release(z);                        // safe: z is still held by a
-// ... use a ...
-tensor_release(a);                        // frees a, then z (ref count -> 0)
-```
-
-No garbage collector. No arena allocator. You own every allocation.
-
-### Safety and error contracts
-
-- Release each owned reference exactly once. `tensor_release(NULL)` is safe, but double-releasing a dangling pointer is not. Create tensors through the API rather than manually constructing or modifying their metadata/graph links.
-- Matrix dimensions must be positive and their element/allocation counts must fit the supported integer sizes. New data and gradient buffers are zero-initialized.
-- Invalid shapes and NULL operands return `NULL` from forward operations. Elementwise operations support equal shapes, a scalar with a matrix, or a `(1, cols)` row bias with `(rows, cols)` in either operand order. Unsupported shapes are rejected before indexing.
-- The core tensor/graph engine checks allocations and fails fast with a diagnostic on allocation failure or graph/reference-count overflow. Auxiliary constructors and the IDX loader return `NULL` on their own allocation failures. Callers must check returned pointers; the examples demonstrate cleanup on recoverable errors.
-- Optimizers borrow their parameter array and tensors. Keep both alive until the optimizer is no longer used, then free the array and release the owning model separately.
-- Keep tensor values unchanged between forward and backward. Ordinary math operations retain C floating-point behavior (including NaN/Inf for undefined domains); they do not clamp values.
-- The IDX loader checks dimensions, counts, labels and every read. It accepts dimensions other than 28x28; `train_mnist` checks for 784 features before indexing data.
-
----
-
-## Cross-Entropy Implementation
-
-The cross-entropy loss is implemented as a **single fused operation** rather than composing `softmax` and `log` through the autograd graph. This avoids numerical instability from computing `log(softmax(x))` naively.
-
-**Forward:**
-```
-log_prob = (logit - max_logit) - log(sum(exp(logits - max_logit)))
-loss     = -sum(target * log_prob) / batch_size
-```
-
-**Backward:**
-
-The backward pass recomputes softmax from the stored logits and directly applies the analytically derived gradient:
-
-```
-dL/dz_j = (softmax(z_j) - target_j) / batch_size
-```
-
-This is the standard composed derivative of cross-entropy with softmax, bypassing the autograd graph for the softmax step itself.
-
----
-
-## Build
-
-Requires only `gcc` and `libm`. No `cmake`, no `configure`, no package manager.
-
-```bash
-make                # builds: train, train_xor, train_mnist
-make check          # operation, ownership and malformed-input regression tests
-make check-sanitize # isolated ASan + UBSan builds, including leak detection
-make clean          # removes all build artifacts
-```
-
----
-
-## Run
-
-### MNIST
-
-Place the raw MNIST IDX binary files in `data/`:
-
-```
-data/train-images-idx3-ubyte
-data/train-labels-idx1-ubyte
-data/t10k-images-idx3-ubyte
-data/t10k-labels-idx1-ubyte
-```
-
-Download from [yann.lecun.com/exdb/mnist](http://yann.lecun.com/exdb/mnist/) or any mirror. Then:
-
-```bash
-./train_mnist
-```
-
-```
-Loading MNIST data...
-Loaded MNIST data: 60000 train, 10000 test
-Model created. Parameters: 235146
-Training for 20 epochs | batch=32 | lr=0.0200
-Epoch 1 [1850/1875] loss=0.7218 lr=0.02000
-...
-Epoch 20 finished. Avg loss: 0.0089
-Computing final accuracy...
-Final Test Accuracy: 98.01%
-```
-
-### XOR
-
-```bash
+```sh
+make                 # train, train_xor, train_mnist
+make check           # complete test suite (assertions remain enabled)
+make check-sanitize  # isolated ASan/UBSan tests with leak detection
+make bench           # build and run rectangular matmul forward/backward benchmark
 ./train_xor
+./train_mnist         # needs raw MNIST IDX files in data/
 ```
 
-```
-Training XOR with MLP (2->4->1)...
-Epoch 0, Loss: 0.286245
-Epoch 500, Loss: 0.005137
-...
-Optimization Finished!
-Predictions:
-In: [0, 0] Target: 0 Pred: 0.0042
-In: [0, 1] Target: 1 Pred: 0.9871
-In: [1, 0] Target: 1 Pred: 0.9863
-In: [1, 1] Target: 0 Pred: 0.0184
-```
+For MNIST, supply `data/train-images-idx3-ubyte`, `data/train-labels-idx1-ubyte`, `data/t10k-images-idx3-ubyte`, and `data/t10k-labels-idx1-ubyte`. `make bench` reports measured timings and checksums on your own machine; no speedup is assumed. Debugging via `tensor_dump_dot` produces a `.dot` file you can optionally render with Graphviz (Graphviz is not required to build or run minigrad).
 
----
+## Tensor ownership, tracking and backward
 
-## API Overview
+Include `engine.h` (and other feature headers as needed). `tensor_create(x)` and `tensor_create_matrix(rows, cols)` create **trainable** leaves by default. To avoid allocating gradient buffers for inputs and labels, use `tensor_create_ex(x, 0)` or `tensor_create_matrix_ex(rows, cols, 0)`; the final argument is `requires_grad`. Frozen tensors have `grad == NULL`. `tensor_set_requires_grad(t, enabled)` changes tracking only on an unshared leaf (no attached graph references); it returns 1 on success, 0 on failure. Do not modify graph metadata, shapes, tracking fields or reference counts yourself; fill `data` via the public buffer before forward and leave it unchanged until backward finishes.
 
-### Tensor
+Each returned tensor is an **owned reference**: release it exactly once with `tensor_release`. Tracked operation results retain *all* parents, including frozen ones whose values are needed in backward. You may release your parent reference after creating the result; the graph keeps the data alive. A no-grad/untracked operation result stores **no parents and no gradient buffer**; if you need an input again, retain your own reference. Do not use a pointer after its final release. `tensor_retain` takes an additional reference; `tensor_release(NULL)` is safe. Model layers own their parameter tensors; `mlp_params`/`linear_params` return a caller-owned **array** of borrowed parameters: free that array separately, and keep the model alive as long as you use the parameters. Optimizers also borrow both that array and its tensors, so free the optimizer before freeing either one.
+
+`grad_set_enabled(0)` temporarily disables graph construction for operation results and returns the previous (thread-local) setting; restore it with `grad_set_enabled(previous)` on **all** paths. Constructors still honor their own `requires_grad` argument regardless of the current grad mode. Use no-grad for inference when backpropagation is unnecessary:
 
 ```c
-Tensor* t = tensor_create(3.14f);                  // scalar
-Tensor* m = tensor_create_matrix(32, 784);          // 2D matrix
-tensor_retain(t);                                    // increment ref count
-tensor_release(t);                                   // decrement, free if zero
-tensor_backward(loss);                               // run reverse-mode autodiff
-tensor_zero_grad(t);                                 // reset gradients to zero
+int previous = grad_set_enabled(0);
+Tensor *prediction = mlp_forward(model, input, 1);
+grad_set_enabled(previous);   /* restore even if prediction == NULL */
+if (prediction) tensor_release(prediction);
 ```
 
-### Neural Network
+`tensor_backward_with_grad(output, upstream)` returns 1 on success, 0 for invalid inputs/seed shapes; `upstream == NULL` supplies all ones. The legacy `tensor_backward(output)` returns void and uses that all-ones seed, differentiating the sum for a nonscalar output. A non-NULL upstream must have the **same shape** as the output; it is read-only. **Leaf gradients accumulate across backward calls and across graphs**, including backward on a leaf root. Intermediate gradients are cleared before every traversal, preventing repeated graph propagation from stale intermediates. Explicitly call `tensor_zero_grad(leaf)` or `sgd_zero_grad`/`adam_zero_grad` before a fresh optimization step. No-grad outputs cannot be differentiated. `tensor_memory_stats()` reports live tensor counts and tensor-owned bytes (including a peak); it excludes traversal and optimizer allocations. Tensor reference counts and these global counters are not thread-safe; thread-local grad mode alone does not make the engine safe for concurrent use.
 
 ```c
-Linearlayer* fc = linear_create(784, 256);           // y = xW + b
-Tensor* out = linear_forward(fc, input);             // forward pass
-
-int sizes[] = {784, 256, 128, 10};
-MLP* model = mlp_create(sizes, 3);                   // 3-layer MLP
-Tensor* logits = mlp_forward(model, x, 1);           // 1 = ReLU, 0 = Tanh
+Tensor *x = tensor_create_matrix_ex(32, 784, 0);
+Tensor *labels = tensor_create_matrix_ex(32, 10, 0);
+/* Fill x->data and labels->data, then compute logits from a model. */
+Tensor *logits = mlp_forward(model, x, 1);
+Tensor *loss = logits ? cross_entropy_loss(logits, labels) : NULL;
+if (loss) {
+    sgd_zero_grad(optimizer);
+    tensor_backward(loss);
+    sgd_step(optimizer);
+}
+tensor_release(loss);
+tensor_release(logits);
+tensor_release(labels);
+tensor_release(x);
 ```
 
-### Loss
+## Differentiable operations and loss
 
-```c
-Tensor* loss = mse_loss(predicted, target);          // mean squared error
-Tensor* loss = cross_entropy_loss(logits, one_hot);  // fused softmax + CE
+Core operations include `tensor_add`, `tensor_sub`, `tensor_mul`, `tensor_div`, `tensor_pow`, `tensor_expn`, `tensor_sqrt`, `tensor_relu`, `tensor_Tanh`, `tensor_mean`, `tensor_softmax` (row-wise 2D) and `tensor_matmul` (2D). Elementwise binary operations broadcast matching 2D axes of size 1: scalar/2D, row `(1, cols)`, column `(rows, 1)`, and `(1, 1)` are supported. Expanded dimensions reduce gradients into the operand. This is **not** general N-dimensional broadcasting. Matrix multiplication requires compatible 2D shapes.
+
+`tensor_ops.h` adds elementwise `tensor_log`, `tensor_sigmoid` and `tensor_softplus`; `tensor_sum_axis(a, axis)` and `tensor_mean_axis(a, axis)` use `axis = -1` for an all-element scalar reduction or axis 0/1 for a 2D keep-dimension result. `tensor_transpose(a)` (2D only) and `tensor_reshape(a, rows, cols)` return **independent contiguous copies**, not shared-storage views. Reshape permits scalar/2D input and requires the same element count; no aliasing or in-place changes are propagated to the input. `tensor_log` follows libm's domain behavior (`log(0) = -Inf`, negative values yield NaN); ordinary math operations do not clamp invalid domains.
+
+`mse_loss(pred, target)` builds mean squared error from differentiable operations. `cross_entropy_loss(logits, targets)` is a fused, stable log-sum-exp loss returning a scalar batch mean. Both inputs must be equal, nonempty `(batch, classes)` matrices. Logits must be finite; targets must be finite and nonnegative, but may be **unnormalized weights**, not just one-hot labels or probabilities. Nonfinite/unrepresentable loss or invalid shape returns `NULL`. The backward pass updates either or both trainable operands using the upstream scalar seed:
+
+```text
+loss      = -sum_rows sum_classes target * logsoftmax(logits) / batch
+∂logits   = (softmax(logits) * sum_classes(target) - target) / batch
+∂targets  = -logsoftmax(logits) / batch
 ```
 
-### Optimizer
+Internally the fused loss uses double precision for log-sum-exp/weighted sums and differences between extreme finite float logits, before storing the scalar result/gradients as float. A mathematical derivative outside float range can still overflow its float gradient buffer. When no-grad is active or neither operand tracks gradients, loss has no graph or grad buffer.
 
-```c
-SGD* opt = sgd_create(params, n_params, 0.02f);
-sgd_zero_grad(opt);                                  // zero all param gradients
-tensor_backward(loss);                                // compute gradients
-sgd_step(opt);                                        // w -= lr * grad
-sgd_set_lr(opt, 0.002f);                             // learning rate decay
-```
+## Training utilities
 
----
+- `optim.h`: `sgd_create(params, n, lr)` and `sgd_create_momentum(params, n, lr, momentum)` (`v = momentum*v + grad`, then `p -= lr*v`); `adam_create` and `adamw_create(params, n, lr, weight_decay)` with standard Adam moments/bias correction and decoupled AdamW weight decay. Use `sgd_step`, `sgd_zero_grad`, `sgd_set_lr`, `sgd_free` or corresponding `adam_*` functions. The optimizer **borrows** the parameter array and tensors but owns its state buffers; frozen/no-grad parameters are skipped. Duplicate parameters are rejected. `optim_clip_grad_norm(params, n, max_norm)` clips in place and returns the *preclip* L2 norm, or NaN without modification on invalid/nonfinite inputs.
+- `rng.h`, `nn.h`, `mlp.h`: seed a `MinigradRNG` with `rng_seed(&rng, seed)`; `rng_uniform` and `rng_normal` use an explicit SplitMix64 state with cached Box–Muller normal values. `linear_create_ex(in, out, INIT_HE /* or INIT_XAVIER */, &rng)` and `mlp_create_ex(sizes, n_layers, INIT_HE, &rng)` use that reproducible stream and do not touch global `rand`. Existing `linear_create`/`mlp_create` remain He-initialized with the legacy `rand` stream; passing `NULL` RNG to the `_ex` constructors also uses it. Biases initialize to zero. `linear_forward`, `mlp_forward`, `linear_free` and `mlp_free` manage their usual layer/model ownership.
+- `gradcheck.h`: `tensor_gradcheck(fn, inputs, n_inputs, context, upstream, epsilon, atol, rtol)` compares reverse-mode VJPs against centered finite differences and returns 1 for agreement. The callback returns one owned output; inputs must be distinct, trainable, unshared leaves. An optional upstream selects a nonscalar VJP; NULL means ones. The checker restores input data, leaf gradients and grad mode, and releases callback results.
+- `checkpoint.h`: `mlp_save(model, path)` returns 1/0; `mlp_load(path)` returns a new owned, trainable MLP or NULL. The versioned, little-endian format stores topology and finite IEEE-754 binary32 weights/biases, with checked dimensions, truncation and resource limits (65,536 layers / 16 million parameters). Loading does not consume the global `rand()` stream. It does **not** store optimizer state, RNG state, gradients or training mode. A load starts with fresh trainable parameters; use `mlp_free` on the result. Failed saves do not replace an existing checkpoint.
+- `debug.h`: `tensor_dump_dot(root, path)` writes the reachable computation graph in Graphviz DOT format (1 success/0 failure); `tensor_check_finite(root, check_gradients)` checks graph data and optionally allocated gradients (1/0); `tensor_summary(tensor, stream)` prints shapes, tracking and value/gradient ranges. These diagnostics work without Graphviz installed. `tensor_memory_stats` is declared in `engine.h`.
+- `kernels.h`: `mg_matmul_forward(a, b, out, m, n, k)` writes contiguous row-major `(m,n) @ (n,k)` into `(m,k)`; `mg_matmul_backward(a, b, upstream, da, db, m, n, k)` **accumulates** gradients into `da` and/or `db` (pass NULL to skip one). These are low-level pure-C kernels; call `tensor_matmul` instead when you need shape validation and autograd graph tracking.
+
+## Scope and limitations
+
+The current implementation is a scalar/contiguous-2D educational engine with per-tensor owned data. It does **not** implement arbitrary-rank tensors, shared-storage views, higher-order automatic differentiation, distributed/GPU execution or optional BLAS integration. Transpose and reshape are copied, not lazy, and cannot share storage; checkpoint loading restores model topology and values only. Matmul has pure-C kernels and a reproducible local benchmark; consult the benchmark output instead of assuming performance figures. Allocation failures in core tensor/graph construction follow the documented fail-fast policy; invalid inputs to pointer-returning APIs return NULL. Floating-point undefined domains retain IEEE/libm behavior unless an API explicitly validates them.
 
 ## License
 

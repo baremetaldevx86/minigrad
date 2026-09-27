@@ -16,6 +16,11 @@ typedef struct {
 // Tensor allocations follow the fail-fast policy documented in engine.h.
 MLP* mlp_create(int* layer_sizes, int n_layers);
 
+// Configurable initializer, sharing one RNG stream across every layer.
+// rng == NULL retains the legacy global rand() stream. Does not own rng/sizes.
+MLP* mlp_create_ex(int* layer_sizes, int n_layers,
+                   WeightInit init, MinigradRNG* rng);
+
 // Forward pass
 // use_relu: 1 for ReLU activation, 0 for Tanh
 Tensor* mlp_forward(MLP* mlp, Tensor* x, int use_relu);

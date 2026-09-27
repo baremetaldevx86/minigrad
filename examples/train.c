@@ -7,8 +7,8 @@
 
 // Create a dataset: y = 3x + 2
 void create_dataset(Tensor** X, Tensor** Y, int n) {
-    *X = tensor_create_matrix(n, 1);
-    *Y = tensor_create_matrix(n, 1);
+    *X = tensor_create_matrix_ex(n, 1, 0);
+    *Y = tensor_create_matrix_ex(n, 1, 0);
     if (!*X || !*Y) return;
 
     for (int i = 0; i < n; i++) {
@@ -26,6 +26,7 @@ int main() {
     float lr = 0.001f;
 
     int status = EXIT_FAILURE;
+    int eval_mode = -1;
     Tensor* X = NULL;
     Tensor* Y = NULL;
     Tensor* tx = NULL;
@@ -87,10 +88,11 @@ int main() {
 
     // Test prediction
     float test_x = 10.0f;
-    tx = tensor_create_matrix(1,1);
+    tx = tensor_create_matrix_ex(1, 1, 0);
     if (!tx) goto cleanup;
     tx->data[0] = test_x;
 
+    eval_mode = grad_set_enabled(0);
     pred = linear_forward(model, tx);
     if (!pred) goto cleanup;
     printf("\nPrediction for x=10: %f (expected ~32)\n", pred->data[0]);
@@ -98,6 +100,7 @@ int main() {
     status = EXIT_SUCCESS;
 
 cleanup:
+    if (eval_mode >= 0) grad_set_enabled(eval_mode);
     tensor_release(tx);
     tensor_release(pred);
     tensor_release(X);

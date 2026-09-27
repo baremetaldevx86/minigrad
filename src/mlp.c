@@ -6,7 +6,13 @@
 #include <stdlib.h>
 
 MLP *mlp_create(int *layer_sizes, int n_layers) {
+    return mlp_create_ex(layer_sizes, n_layers, INIT_HE, NULL);
+}
+
+MLP *mlp_create_ex(int *layer_sizes, int n_layers,
+                   WeightInit init, MinigradRNG *rng) {
     if (!layer_sizes || n_layers <= 0 ||
+        (init != INIT_HE && init != INIT_XAVIER) ||
         (size_t)n_layers > SIZE_MAX / sizeof(Linearlayer *)) {
         fprintf(stderr, "minigrad: mlp_create: invalid layer configuration\n");
         return NULL;
@@ -31,7 +37,7 @@ MLP *mlp_create(int *layer_sizes, int n_layers) {
             mlp_free(mlp);
             return NULL;
         }
-        mlp->layers[i] = linear_create(layer_sizes[i], layer_sizes[i + 1]);
+        mlp->layers[i] = linear_create_ex(layer_sizes[i], layer_sizes[i + 1], init, rng);
         if (!mlp->layers[i]) {
             mlp_free(mlp);
             return NULL;

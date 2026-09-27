@@ -15,13 +15,14 @@
 
 int main(void) {
     int status = EXIT_FAILURE;
+    int eval_mode = -1;
     MLP* model = NULL;
     Tensor** params = NULL;
     SGD* opt = NULL;
     Tensor* final_pred = NULL;
     // 1. Prepare Data
-    Tensor* X = tensor_create_matrix(4, 2);
-    Tensor* Y = tensor_create_matrix(4, 1);
+    Tensor* X = tensor_create_matrix_ex(4, 2, 0);
+    Tensor* Y = tensor_create_matrix_ex(4, 1, 0);
     if (!X || !Y) goto cleanup;
     
     // Inputs
@@ -88,6 +89,7 @@ int main(void) {
     // 5. Validation
     printf("\nOptimization Finished!\n");
     printf("Predictions:\n");
+    eval_mode = grad_set_enabled(0);
     final_pred = mlp_forward(model, X, 0);
     if (!final_pred) goto cleanup;
     for (int i = 0; i < 4; i++) {
@@ -101,6 +103,7 @@ int main(void) {
     status = EXIT_SUCCESS;
 
 cleanup:
+    if (eval_mode >= 0) grad_set_enabled(eval_mode);
     tensor_release(final_pred);
     tensor_release(X);
     tensor_release(Y);

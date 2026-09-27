@@ -12,16 +12,25 @@ static float rand_normal(void) {
     return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * pi * u2);
 }
 
-static void init_weights(Tensor *weights, int in_features) {
-    float scale = sqrtf(2.0f / (float)in_features);
+static void init_weights(Tensor *weights, int in_features, int out_features,
+                         WeightInit init, MinigradRNG *rng) {
+    /* Compute fan sums in double to avoid overflowing a signed int. */
+    float scale = init == INIT_HE ? sqrtf(2.0f / (float)in_features)
+        : (float)sqrt(2.0 / ((double)in_features + (double)out_features));
     for (int i = 0; i < weights->size; i++) {
-        weights->data[i] = rand_normal() * scale;
+        weights->data[i] = (rng ? rng_normal(rng) : rand_normal()) * scale;
     }
 }
 
 Linearlayer *linear_create(int in_features, int out_features) {
-    if (in_features <= 0 || out_features <= 0) {
-        fprintf(stderr, "minigrad: linear_create: dimensions must be positive\n");
+    return linear_create_ex(in_features, out_features, INIT_HE, NULL);
+}
+
+Linearlayer *linear_create_ex(int in_features, int out_features,
+                             WeightInit init, MinigradRNG *rng) {
+    if (in_features <= 0 || out_features <= 0 ||
+        (init != INIT_HE && init != INIT_XAVIER)) {
+        fprintf(stderr, "minigrad: linear_create_ex: invalid dimensions or initializer\n");
         return NULL;
     }
 
@@ -43,7 +52,7 @@ Linearlayer *linear_create(int in_features, int out_features) {
         return NULL;
     }
 
-    init_weights(layer->W, in_features);
+    init_weights(layer->W, in_features, out_features, init, rng);
     /* tensor_create_matrix initializes the bias to zero. */
     return layer;
 }
